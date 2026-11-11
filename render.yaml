@@ -1,0 +1,21 @@
+services:
+  - type: cron
+    name: anistream-updater
+    env: python
+    schedule: "0 7 * * *"   # todo dia às 07:00 UTC = 04:00 Brasília
+    buildCommand: pip install -r requirements.txt
+    startCommand: >
+      python anistream_scraper.py
+      --api-key $ANISTREAM_API_KEY
+      --user-id $ANISTREAM_USER_ID
+      --mode all
+      --no-tag
+      --workers 6
+      --pull-github
+    envVars:
+      - key: ANISTREAM_API_KEY
+        sync: false          # preenche no dashboard do Render
+      - key: ANISTREAM_USER_ID
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
