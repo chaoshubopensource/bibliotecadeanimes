@@ -1,0 +1,40 @@
+name: Atualizar Biblioteca
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # todo dia às 07:00 UTC = 04:00 Brasília
+  workflow_dispatch:       # permite rodar manualmente pelo GitHub
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # precisa pra fazer commit de volta no repo
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Instalar dependências
+        run: pip install requests urllib3
+
+      - name: Rodar scraper
+        env:
+          ANISTREAM_API_KEY: ${{ secrets.ANISTREAM_API_KEY }}
+          ANISTREAM_USER_ID: ${{ secrets.ANISTREAM_USER_ID }}
+        run: |
+          python anistream_scraper.py \
+            --api-key "$ANISTREAM_API_KEY" \
+            --user-id "$ANISTREAM_USER_ID" \
+            --mode update-library \
+            --no-tag \
+            --workers 6
+
+      - name: Commitar e enviar JSON atualizado
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add biblioteca_completa.json
+          git diff --cached --quiet && echo "nada novo, sem commit" || \
+            git commit -m "auto: atualiza biblioteca $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
