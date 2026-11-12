@@ -10,9 +10,11 @@ from urllib3.util.retry import Retry
 
 BASE            = "https://app.anistream.biz"
 KNOWN_DEVICE_ID = "a9d0ebde-e77e-48d6-a6ee-cbfa9c991c1f"
+# AudioStreamIndex é definido dinamicamente por get_playback_info()
+# VideoBitrate baixado para 8 Mbps — força transcode pelo Jellyfin (resolve áudio AC3→AAC na maioria dos casos)
 STREAM_BASE     = (
-    "VideoCodec=hevc,h264&AudioCodec=copy&AudioStreamIndex=1"
-    "&VideoBitrate=33233505&AudioBitrate=192000&AudioSampleRate=48000"
+    "VideoCodec=hevc,h264&AudioCodec=aac"
+    "&VideoBitrate=8000000&AudioBitrate=192000"
     "&MaxFramerate=23.976025&SegmentContainer=ts&MinSegments=2"
     "&TranscodingMaxAudioChannels=6&RequireAvc=false"
     "&EnableAudioVbrEncoding=true&VideoStreamIndex=0"
@@ -269,7 +271,45 @@ def get_episodes(session, user_id, series_id):
         print(f"    … {len(all_eps)}/{total} eps", flush=True)
     return all_eps
 
+def _best_audio_index(streams):
+    """Escolhe o melhor AudioStreamIndex a partir da lista de MediaStreams do Jellyfin.
+    Prioridade:
+      1. stream de áudio marcado como IsDefault em PT/ptbr
+      2. qualquer stream de áudio em PT/ptbr
+      3. stream de áudio marcado como IsDefault
+      4. primeiro stream de áudio encontrado
+    Retorna o Index (int) ou None se não houver streams de áudio.
+    """
+    audio = [s for s in streams if s.get("Type") == "Audio"]
+    if not audio:
+        return None
+
+    PT_LANGS = {"por", "pt", "ptbr", "pt-br", "portuguese"}
+
+    def is_pt(s):
+        lang = (s.get("Language") or "").lower().replace("-", "")
+        return lang in PT_LANGS
+
+    # 1 — default PT
+    for s in audio:
+        if s.get("IsDefault") and is_pt(s):
+            return s["Index"]
+    # 2 — qualquer PT
+    for s in audio:
+        if is_pt(s):
+            return s["Index"]
+    # 3 — default
+    for s in audio:
+        if s.get("IsDefault"):
+            return s["Index"]
+    # 4 — primeiro
+    return audio[0]["Index"]
+
+
 def get_playback_info(session, user_id, item_id):
+    """Retorna (media_source_id, tag, audio_stream_index).
+    audio_stream_index é None se não conseguiu determinar (usa fallback no build_url).
+    """
     try:
         r = session.post(
             f"{BASE}/Items/{dash(item_id)}/PlaybackInfo",
@@ -280,20 +320,28 @@ def get_playback_info(session, user_id, item_id):
         if r.ok:
             sources = r.json().get("MediaSources", [])
             if sources:
-                src = sources[0]
-                return src.get("Id", item_id), src.get("ETag", "")
+                src     = sources[0]
+                msid    = src.get("Id", item_id)
+                tag     = src.get("ETag", "")
+                streams = src.get("MediaStreams", [])
+                aidx    = _best_audio_index(streams)
+                return msid, tag, aidx
     except Exception:
         pass
-    return item_id, ""
+    return item_id, "", None
 
-def build_url(item_id, media_source_id, key, play_session, tag=""):
+
+def build_url(item_id, media_source_id, key, play_session, tag="", audio_idx=None):
     iid  = dash(item_id.replace("-", ""))
     msid = media_source_id.replace("-", "")
+    # fallback: índice 1 se PlaybackInfo não retornou nada
+    aidx = audio_idx if audio_idx is not None else 1
     url  = (
         f"{BASE}/videos/{iid}/main.m3u8"
         f"?DeviceId={KNOWN_DEVICE_ID}"
         f"&MediaSourceId={msid}"
         f"&{STREAM_BASE}"
+        f"&AudioStreamIndex={aidx}"
         f"&PlaySessionId={play_session}"
         f"&ApiKey={key}"
     )
@@ -313,24 +361,24 @@ def scrape_serie(session, user_id, series_id, anime_name, key, no_tag=False):
             num = f"S{season}E{num}"
         play_session = secrets.token_hex(16)
         if no_tag:
-            msid, tag = item_id.replace("-", ""), ""
+            msid, tag, aidx = item_id.replace("-", ""), "", None
         else:
-            msid, tag = get_playback_info(session, user_id, item_id)
+            msid, tag, aidx = get_playback_info(session, user_id, item_id)
             msid = (msid or item_id).replace("-", "")
         ep_list.append({"id": new_uid(), "num": num,
-                        "url": build_url(item_id, msid, key, play_session, tag)})
+                        "url": build_url(item_id, msid, key, play_session, tag, aidx)})
     return ep_list
 
 def scrape_movie(session, user_id, item_id, key, no_tag=False):
     """Filmes não têm episódios — usa o próprio item como única entrada."""
     play_session = secrets.token_hex(16)
     if no_tag:
-        msid, tag = item_id.replace("-", ""), ""
+        msid, tag, aidx = item_id.replace("-", ""), "", None
     else:
-        msid, tag = get_playback_info(session, user_id, item_id)
+        msid, tag, aidx = get_playback_info(session, user_id, item_id)
         msid = (msid or item_id).replace("-", "")
     return [{"id": new_uid(), "num": "1",
-             "url": build_url(item_id, msid, key, play_session, tag)}]
+             "url": build_url(item_id, msid, key, play_session, tag, aidx)}]
 
 # ── worker pool com throttle adaptativo ──────────────────────────────────────
 
@@ -535,11 +583,11 @@ def mode_update_library(session, user_id, args):
             if not item_id: continue
             play_session = secrets.token_hex(16)
             if args.no_tag:
-                msid, tag = item_id, ""
+                msid, tag, aidx = item_id, "", None
             else:
-                msid, tag = get_playback_info(session, user_id, item_id)
+                msid, tag, aidx = get_playback_info(session, user_id, item_id)
                 msid = (msid or item_id).replace("-", "")
-            ep["url"] = build_url(item_id, msid, args.api_key, play_session, tag)
+            ep["url"] = build_url(item_id, msid, args.api_key, play_session, tag, aidx)
             updated += 1
         if updated:
             print(f"→ {updated} eps"); ok += 1
