@@ -274,21 +274,31 @@ def get_episodes(session, user_id, series_id):
 def _best_audio_index(streams):
     """Escolhe o melhor AudioStreamIndex a partir da lista de MediaStreams do Jellyfin.
     Prioridade:
-      1. stream de áudio marcado como IsDefault em PT/ptbr
-      2. qualquer stream de áudio em PT/ptbr
-      3. stream de áudio marcado como IsDefault
+      1. stream de áudio PT marcado como IsDefault
+      2. qualquer stream de áudio PT
+      3. stream de áudio marcado como IsDefault (japonês/outro)
       4. primeiro stream de áudio encontrado
+    Detecta PT tanto pelo campo Language quanto por Title/DisplayTitle.
     Retorna o Index (int) ou None se não houver streams de áudio.
     """
     audio = [s for s in streams if s.get("Type") == "Audio"]
     if not audio:
         return None
 
-    PT_LANGS = {"por", "pt", "ptbr", "pt-br", "portuguese"}
+    PT_LANGS = {"por", "pt", "ptbr", "ptbr", "portuguese", "port", "pb", "pt-br", "pt_br"}
+    PT_WORDS = ("portugu", "brasil", "portuguese", "pt-br", "ptbr")
 
     def is_pt(s):
-        lang = (s.get("Language") or "").lower().replace("-", "")
-        return lang in PT_LANGS
+        # verifica campo Language (ISO 639)
+        lang = (s.get("Language") or "").lower().replace("-", "").replace("_", "")
+        if lang in PT_LANGS:
+            return True
+        # verifica Title e DisplayTitle (ex: "Português", "Portuguese", "Português (Brasil)")
+        for field in ("Title", "DisplayTitle", "Label"):
+            t = (s.get(field) or "").lower()
+            if any(w in t for w in PT_WORDS):
+                return True
+        return False
 
     # 1 — default PT
     for s in audio:
@@ -298,11 +308,11 @@ def _best_audio_index(streams):
     for s in audio:
         if is_pt(s):
             return s["Index"]
-    # 3 — default
+    # 3 — default (sem PT disponível → original/japonês)
     for s in audio:
         if s.get("IsDefault"):
             return s["Index"]
-    # 4 — primeiro
+    # 4 — primeiro encontrado
     return audio[0]["Index"]
 
 
