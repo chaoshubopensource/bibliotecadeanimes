@@ -324,7 +324,23 @@ def get_playback_info(session, user_id, item_id):
         r = session.post(
             f"{BASE}/Items/{dash(item_id)}/PlaybackInfo",
             params={"UserId": user_id},
-            json={"DeviceProfile": {}},
+            json={
+                "DeviceProfile": {
+                    "DirectPlayProfiles": [],
+                    "TranscodingProfiles": [
+                        {
+                            "Container": "ts",
+                            "Type": "Video",
+                            "AudioCodec": "aac",
+                            "VideoCodec": "h264",
+                            "Context": "Streaming",
+                            "Protocol": "hls",
+                        }
+                    ],
+                    "CodecProfiles": [],
+                    "SubtitleProfiles": [],
+                }
+            },
             timeout=(8, 15),
         )
         if r.ok:
@@ -335,9 +351,23 @@ def get_playback_info(session, user_id, item_id):
                 tag     = src.get("ETag", "")
                 streams = src.get("MediaStreams", [])
                 aidx    = _best_audio_index(streams)
+                # log de áudio para diagnóstico
+                audio_streams = [s for s in streams if s.get("Type") == "Audio"]
+                if audio_streams:
+                    info = ", ".join(
+                        f"[{s.get('Index')}] lang={s.get('Language','?')} "
+                        f"title={s.get('Title','')!r} default={s.get('IsDefault',False)}"
+                        for s in audio_streams
+                    )
+                    print(f"      audio streams: {info}", flush=True)
+                    print(f"      → AudioStreamIndex escolhido: {aidx}", flush=True)
+                else:
+                    print(f"      AVISO: nenhum stream de áudio em {item_id}", flush=True)
                 return msid, tag, aidx
-    except Exception:
-        pass
+        else:
+            print(f"      PlaybackInfo FALHOU: HTTP {r.status_code} para {item_id}", flush=True)
+    except Exception as e:
+        print(f"      PlaybackInfo ERRO: {e} para {item_id}", flush=True)
     return item_id, "", None
 
 
