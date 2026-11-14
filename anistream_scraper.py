@@ -341,8 +341,35 @@ def _playback_info_post(session, user_id, iid, audio_idx=None):
     return None, None, None
 
 
-def _detect_pt_index(session, item_id):
-    """GET /Items/{id}?Fields=MediaStreams — retorna índice PT ou None (rápido, sem POST)."""
+def _best_subtitle_index(streams):
+    """Retorna o índice da legenda PT ou None."""
+    subs = [s for s in streams if s.get("Type") == "Subtitle"]
+    if not subs:
+        return None
+    PT_LANGS = {"por", "pt", "ptbr", "portuguese", "port", "pb", "pt-br", "pt_br"}
+    PT_WORDS = ("portugu", "brasil", "pt-br", "ptbr")
+
+    def is_pt(s):
+        lang = (s.get("Language") or "").lower().replace("-", "").replace("_", "")
+        if lang in PT_LANGS:
+            return True
+        for field in ("Title", "DisplayTitle", "Label"):
+            t = (s.get(field) or "").lower()
+            if any(w in t for w in PT_WORDS):
+                return True
+        return False
+
+    for s in subs:
+        if s.get("IsDefault") and is_pt(s):
+            return s["Index"]
+    for s in subs:
+        if is_pt(s):
+            return s["Index"]
+    return None
+
+
+def _detect_pt_streams(session, item_id):
+    """GET /Items/{id}?Fields=MediaStreams — retorna (audio_idx, sub_idx), ambos podem ser None."""
     iid = dash(item_id)
     try:
         r = session.get(
@@ -358,10 +385,16 @@ def _detect_pt_index(session, item_id):
                     streams = src.get("MediaStreams") or []
                     if streams:
                         break
-            return _best_audio_index(streams)
+            return _best_audio_index(streams), _best_subtitle_index(streams)
     except Exception:
         pass
-    return None
+    return None, None
+
+
+def _detect_pt_index(session, item_id):
+    """Compat — retorna só audio_idx."""
+    audio_idx, _ = _detect_pt_streams(session, item_id)
+    return audio_idx
 
 
 def get_playback_info(session, user_id, item_id):
@@ -652,28 +685,39 @@ def mode_update_library(session, user_id, args):
             print(f"{tag_prefix}  — sem eps", flush=True)
             return False
 
-        # 1 GET para detectar PT no primeiro ep
-        pt_idx = _detect_pt_index(session, ep_ids[0][1])
+        # 1 GET para detectar PT no primeiro ep (áudio + legenda)
+        pt_audio, pt_sub = _detect_pt_streams(session, ep_ids[0][1])
 
-        if pt_idx is not None:
-            label = f"🇧🇷 PT (idx={pt_idx}) → padrão PT"
-        else:
-            label = "🇯🇵 só japonês"
+        parts = []
+        if pt_audio is not None:
+            parts.append(f"🇧🇷 áudio (idx={pt_audio})")
+        if pt_sub is not None:
+            parts.append(f"legenda (idx={pt_sub})")
+        label = "  ".join(parts) if parts else "🇯🇵 só japonês"
 
         print(f"{tag_prefix}  {label}  ({len(ep_ids)} eps)", flush=True)
 
         for ep, item_id in ep_ids:
             play_session = secrets.token_hex(16)
             iid          = dash(item_id)
-            if pt_idx is not None:
-                msid, tag, _ = _playback_info_post(session, user_id, iid, audio_idx=pt_idx)
+            if pt_audio is not None:
+                msid, tag, _ = _playback_info_post(session, user_id, iid, audio_idx=pt_audio)
                 msid = (msid or item_id).replace("-", "")
-                aidx = pt_idx
+                aidx = pt_audio
             else:
                 msid = item_id.replace("-", "")
                 tag  = ""
                 aidx = 1
             ep["url"] = build_url(item_id, msid, args.api_key, play_session, tag, aidx)
+            # legenda PT
+            if pt_sub is not None:
+                ep["sub"] = (
+                    f"{BASE}/Videos/{iid}/{msid}"
+                    f"/Subtitles/{pt_sub}/0/Stream.vtt"
+                    f"?ApiKey={args.api_key}"
+                )
+            else:
+                ep.pop("sub", None)   # remove campo legado se não há mais legenda
 
         return True
 
