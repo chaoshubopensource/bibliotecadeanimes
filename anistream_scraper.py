@@ -351,6 +351,29 @@ def _playback_info_post(session, user_id, iid, audio_idx=None):
     return None, None, None
 
 
+def _detect_pt_index(session, item_id):
+    """GET /Items/{id}?Fields=MediaStreams — retorna índice PT ou None (rápido, sem POST)."""
+    iid = dash(item_id)
+    try:
+        r = session.get(
+            f"{BASE}/Items/{iid}",
+            params={"Fields": "MediaStreams"},
+            timeout=(5, 15),
+        )
+        if r.ok:
+            data = r.json()
+            streams = data.get("MediaStreams") or []
+            if not streams:
+                for src in data.get("MediaSources", []):
+                    streams = src.get("MediaStreams") or []
+                    if streams:
+                        break
+            return _best_audio_index(streams)
+    except Exception:
+        pass
+    return None
+
+
 def get_playback_info(session, user_id, item_id):
     """Retorna (media_source_id, tag, audio_stream_index).
 
@@ -360,47 +383,16 @@ def get_playback_info(session, user_id, item_id):
          → Jellyfin devolve MediaSourceId gerado pra esse áudio (obrigatório)
       Se PT não encontrado → POST PlaybackInfo sem preferência de áudio
     """
-    iid = dash(item_id)
+    iid    = dash(item_id)
+    pt_idx = _detect_pt_index(session, item_id)
 
-    # ── passo 1: detecta streams via GET ──────────────────────────────────────
-    streams_detected = []
-    try:
-        r = session.get(
-            f"{BASE}/Items/{iid}",
-            params={"Fields": "MediaStreams"},
-            timeout=(5, 15),
-        )
-        if r.ok:
-            data = r.json()
-            streams_detected = data.get("MediaStreams") or []
-            if not streams_detected:
-                for src in data.get("MediaSources", []):
-                    streams_detected = src.get("MediaStreams") or []
-                    if streams_detected:
-                        break
-    except Exception as e:
-        print(f"      GET /Items erro: {e}", flush=True)
-
-    pt_idx = None
-    if streams_detected:
-        pt_idx = _best_audio_index(streams_detected)
-        audio = [s for s in streams_detected if s.get("Type") == "Audio"]
-        info  = ", ".join(
-            f"[{s.get('Index')}] lang={s.get('Language','?')!r} default={s.get('IsDefault',False)}"
-            for s in audio
-        )
-        print(f"      streams: {info}  → pt_idx={pt_idx}", flush=True)
-
-    # ── passo 2: POST PlaybackInfo com AudioStreamIndex do PT ──────────────────
+    # ── POST PlaybackInfo com AudioStreamIndex do PT (ou padrão) ──────────────
     msid, tag, streams_pb = _playback_info_post(session, user_id, iid, audio_idx=pt_idx)
 
     if msid:
-        # usa o índice que detectamos (ou o default do PlaybackInfo se não detectamos)
         aidx = pt_idx if pt_idx is not None else _best_audio_index(streams_pb or [])
         return msid, tag, aidx
 
-    # ── fallback total ─────────────────────────────────────────────────────────
-    print(f"      fallback total para {item_id}", flush=True)
     return item_id, "", pt_idx
 
 
@@ -642,30 +634,67 @@ def mode_farm(session, user_id, args):
 
 
 def mode_update_library(session, user_id, args):
+    """Atualiza URLs da biblioteca.
+
+    Fast-path: detecta PT apenas no PRIMEIRO episódio do anime.
+      • PT encontrado → POST PlaybackInfo com AudioStreamIndex=PT em cada ep
+      • Só japonês    → monta URL direto (AudioStreamIndex=1) sem chamada extra
+    """
     lib = load_library()
     if not lib["animes"]:
         print("  biblioteca vazia."); return
-    print(f"  {len(lib['animes'])} animes na biblioteca")
+    total_animes = len(lib["animes"])
+    print(f"  {total_animes} animes na biblioteca\n")
     ok = fail = 0
+
     for i, anime in enumerate(lib["animes"], 1):
         name = anime["name"]
-        print(f"  [{i:>4}/{len(lib['animes'])}] {name}", end="  ", flush=True)
-        updated = 0
-        for ep in anime["episodes"]:
-            item_id = item_id_from_url(ep["url"])
-            if not item_id: continue
-            play_session = secrets.token_hex(16)
-            if args.no_tag:
-                msid, tag, aidx = item_id, "", None
-            else:
-                msid, tag, aidx = get_playback_info(session, user_id, item_id)
-                msid = (msid or item_id).replace("-", "")
-            ep["url"] = build_url(item_id, msid, args.api_key, play_session, tag, aidx)
-            updated += 1
-        if updated:
-            print(f"→ {updated} eps"); ok += 1
+        eps  = anime["episodes"]
+        tag_prefix = f"  [{i:>4}/{total_animes}] {name}"
+
+        # ── coleta item_ids válidos ───────────────────────────────────────────
+        ep_ids = []
+        for ep in eps:
+            iid = item_id_from_url(ep["url"])
+            if iid:
+                ep_ids.append((ep, iid))
+
+        if not ep_ids:
+            print(f"{tag_prefix}  — sem eps", flush=True)
+            fail += 1
+            continue
+
+        # ── detecta PT no primeiro episódio (1 GET apenas) ───────────────────
+        first_id = ep_ids[0][1]
+        pt_idx   = _detect_pt_index(session, first_id)
+
+        if pt_idx is not None:
+            audio_label = f"🇧🇷 PT encontrado (idx={pt_idx}) → padrão PT"
         else:
-            print("— sem eps"); fail += 1
+            audio_label = "🇯🇵 só japonês → padrão japonês"
+
+        print(f"{tag_prefix}  {audio_label}  ({len(ep_ids)} eps)", flush=True)
+
+        # ── atualiza cada episódio ────────────────────────────────────────────
+        for ep, item_id in ep_ids:
+            play_session = secrets.token_hex(16)
+            iid          = dash(item_id)
+
+            if pt_idx is not None:
+                # precisa de MediaSourceId específico para o áudio PT
+                msid, tag, _ = _playback_info_post(session, user_id, iid, audio_idx=pt_idx)
+                msid = (msid or item_id).replace("-", "")
+                aidx = pt_idx
+            else:
+                # fast-path: sem PlaybackInfo, japonês padrão
+                msid = item_id.replace("-", "")
+                tag  = ""
+                aidx = 1
+
+            ep["url"] = build_url(item_id, msid, args.api_key, play_session, tag, aidx)
+
+        ok += 1
+
     flush_library(lib)
     print(f"\n  update: {ok} ok  {fail} falhou  →  {LIBRARY_FILE}")
 
