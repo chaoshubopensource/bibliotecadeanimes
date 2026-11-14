@@ -316,27 +316,54 @@ def _best_audio_index(streams):
     return audio[0]["Index"]
 
 
-def _log_audio(streams, aidx, source=""):
-    audio = [s for s in streams if s.get("Type") == "Audio"]
-    if not audio:
-        return
-    info = ", ".join(
-        f"[{s.get('Index')}] lang={s.get('Language','?')!r} "
-        f"title={s.get('Title','')!r} default={s.get('IsDefault',False)}"
-        for s in audio
-    )
-    tag = f" ({source})" if source else ""
-    print(f"      áudio{tag}: {info}  → escolhido={aidx}", flush=True)
+_DEVICE_PROFILE = {
+    "DirectPlayProfiles": [],
+    "TranscodingProfiles": [{
+        "Container": "ts", "Type": "Video",
+        "AudioCodec": "aac", "VideoCodec": "h264",
+        "Context": "Streaming", "Protocol": "hls",
+    }],
+    "CodecProfiles": [], "SubtitleProfiles": [],
+}
+
+
+def _playback_info_post(session, user_id, iid, audio_idx=None):
+    """POST /PlaybackInfo — retorna (msid, tag, streams) ou (None, None, None) em erro."""
+    body = {"DeviceProfile": _DEVICE_PROFILE}
+    if audio_idx is not None:
+        body["AudioStreamIndex"] = audio_idx
+    try:
+        r = session.post(
+            f"{BASE}/Items/{iid}/PlaybackInfo",
+            params={"UserId": user_id},
+            json=body,
+            timeout=(8, 20),
+        )
+        if r.ok:
+            sources = r.json().get("MediaSources", [])
+            if sources:
+                src = sources[0]
+                return src.get("Id", iid), src.get("ETag", ""), src.get("MediaStreams", [])
+        else:
+            print(f"      PlaybackInfo HTTP {r.status_code}", flush=True)
+    except Exception as e:
+        print(f"      PlaybackInfo erro: {e}", flush=True)
+    return None, None, None
 
 
 def get_playback_info(session, user_id, item_id):
     """Retorna (media_source_id, tag, audio_stream_index).
-    Estratégia: GET /Items/{id}?Fields=MediaStreams primeiro (simples, sem DeviceProfile),
-    depois POST PlaybackInfo como fallback.
+
+    Fluxo de dois passos para PT-BR:
+      1. GET /Items/{id}?Fields=MediaStreams  → detecta índice do áudio PT
+      2. Se PT encontrado → POST PlaybackInfo com AudioStreamIndex=PT no body
+         → Jellyfin devolve MediaSourceId gerado pra esse áudio (obrigatório)
+      Se PT não encontrado → POST PlaybackInfo sem preferência de áudio
     """
     iid = dash(item_id)
 
-    # ── 1. GET /Items/{id}?Fields=MediaStreams (mais confiável) ──────────────
+    # ── passo 1: detecta streams via GET ──────────────────────────────────────
+    streams_detected = []
     try:
         r = session.get(
             f"{BASE}/Items/{iid}",
@@ -344,55 +371,37 @@ def get_playback_info(session, user_id, item_id):
             timeout=(5, 15),
         )
         if r.ok:
-            data    = r.json()
-            # MediaStreams pode estar direto no item ou dentro de MediaSources
-            streams = data.get("MediaStreams") or []
-            if not streams:
+            data = r.json()
+            streams_detected = data.get("MediaStreams") or []
+            if not streams_detected:
                 for src in data.get("MediaSources", []):
-                    streams = src.get("MediaStreams") or []
-                    if streams: break
-            if streams:
-                aidx = _best_audio_index(streams)
-                _log_audio(streams, aidx, "GET")
-                return item_id, "", aidx
+                    streams_detected = src.get("MediaStreams") or []
+                    if streams_detected:
+                        break
     except Exception as e:
-        print(f"      GET /Items falhou: {e}", flush=True)
+        print(f"      GET /Items erro: {e}", flush=True)
 
-    # ── 2. fallback: POST PlaybackInfo ───────────────────────────────────────
-    try:
-        r = session.post(
-            f"{BASE}/Items/{iid}/PlaybackInfo",
-            params={"UserId": user_id},
-            json={
-                "DeviceProfile": {
-                    "DirectPlayProfiles": [],
-                    "TranscodingProfiles": [{
-                        "Container": "ts", "Type": "Video",
-                        "AudioCodec": "aac", "VideoCodec": "h264",
-                        "Context": "Streaming", "Protocol": "hls",
-                    }],
-                    "CodecProfiles": [], "SubtitleProfiles": [],
-                }
-            },
-            timeout=(8, 20),
+    pt_idx = None
+    if streams_detected:
+        pt_idx = _best_audio_index(streams_detected)
+        audio = [s for s in streams_detected if s.get("Type") == "Audio"]
+        info  = ", ".join(
+            f"[{s.get('Index')}] lang={s.get('Language','?')!r} default={s.get('IsDefault',False)}"
+            for s in audio
         )
-        if r.ok:
-            sources = r.json().get("MediaSources", [])
-            if sources:
-                src     = sources[0]
-                msid    = src.get("Id", item_id)
-                tag     = src.get("ETag", "")
-                streams = src.get("MediaStreams", [])
-                aidx    = _best_audio_index(streams)
-                _log_audio(streams, aidx, "POST")
-                return msid, tag, aidx
-            print(f"      PlaybackInfo: MediaSources vazio para {item_id}", flush=True)
-        else:
-            print(f"      PlaybackInfo FALHOU: HTTP {r.status_code} para {item_id}", flush=True)
-    except Exception as e:
-        print(f"      PlaybackInfo ERRO: {e}", flush=True)
+        print(f"      streams: {info}  → pt_idx={pt_idx}", flush=True)
 
-    return item_id, "", None
+    # ── passo 2: POST PlaybackInfo com AudioStreamIndex do PT ──────────────────
+    msid, tag, streams_pb = _playback_info_post(session, user_id, iid, audio_idx=pt_idx)
+
+    if msid:
+        # usa o índice que detectamos (ou o default do PlaybackInfo se não detectamos)
+        aidx = pt_idx if pt_idx is not None else _best_audio_index(streams_pb or [])
+        return msid, tag, aidx
+
+    # ── fallback total ─────────────────────────────────────────────────────────
+    print(f"      fallback total para {item_id}", flush=True)
+    return item_id, "", pt_idx
 
 
 def build_url(item_id, media_source_id, key, play_session, tag="", audio_idx=None):
