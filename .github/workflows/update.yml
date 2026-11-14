@@ -2,14 +2,14 @@ name: Atualizar Biblioteca
 
 on:
   schedule:
-    - cron: "0 7 * * *"   # todo dia às 07:00 UTC = 04:00 Brasília
-  workflow_dispatch:       # permite rodar manualmente pelo GitHub
+    - cron: "0 7 * * *"
+  workflow_dispatch:
 
 jobs:
   update:
     runs-on: ubuntu-latest
     permissions:
-      contents: write      # precisa pra fazer commit de volta no repo
+      contents: write
 
     steps:
       - name: Checkout repo
@@ -27,7 +27,6 @@ jobs:
             --api-key "$ANISTREAM_API_KEY" \
             --user-id "$ANISTREAM_USER_ID" \
             --mode update-library \
-            --no-tag \
             --workers 6
 
       - name: Commitar e enviar JSON atualizado
