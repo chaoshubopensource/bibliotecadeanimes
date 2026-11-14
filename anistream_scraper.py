@@ -272,28 +272,22 @@ def get_episodes(session, user_id, series_id):
     return all_eps
 
 def _best_audio_index(streams):
-    """Escolhe o melhor AudioStreamIndex a partir da lista de MediaStreams do Jellyfin.
-    Prioridade:
-      1. stream de áudio PT marcado como IsDefault
-      2. qualquer stream de áudio PT
-      3. stream de áudio marcado como IsDefault (japonês/outro)
-      4. primeiro stream de áudio encontrado
-    Detecta PT tanto pelo campo Language quanto por Title/DisplayTitle.
-    Retorna o Index (int) ou None se não houver streams de áudio.
+    """Retorna o índice do áudio PT-BR ou None se não existir.
+
+    Detecta PT pelo campo Language (ISO 639) ou Title/DisplayTitle.
+    NÃO faz fallback para japonês — retorna None se PT ausente.
     """
     audio = [s for s in streams if s.get("Type") == "Audio"]
     if not audio:
         return None
 
-    PT_LANGS = {"por", "pt", "ptbr", "ptbr", "portuguese", "port", "pb", "pt-br", "pt_br"}
-    PT_WORDS = ("portugu", "brasil", "portuguese", "pt-br", "ptbr")
+    PT_LANGS  = {"por", "pt", "ptbr", "portuguese", "port", "pb", "pt-br", "pt_br"}
+    PT_WORDS  = ("portugu", "brasil", "pt-br", "ptbr")
 
     def is_pt(s):
-        # verifica campo Language (ISO 639)
         lang = (s.get("Language") or "").lower().replace("-", "").replace("_", "")
         if lang in PT_LANGS:
             return True
-        # verifica Title e DisplayTitle (ex: "Português", "Portuguese", "Português (Brasil)")
         for field in ("Title", "DisplayTitle", "Label"):
             t = (s.get(field) or "").lower()
             if any(w in t for w in PT_WORDS):
@@ -308,12 +302,8 @@ def _best_audio_index(streams):
     for s in audio:
         if is_pt(s):
             return s["Index"]
-    # 3 — default (sem PT disponível → original/japonês)
-    for s in audio:
-        if s.get("IsDefault"):
-            return s["Index"]
-    # 4 — primeiro encontrado
-    return audio[0]["Index"]
+    # sem PT → retorna None (japonês é o fallback do caller)
+    return None
 
 
 _DEVICE_PROFILE = {
@@ -634,9 +624,9 @@ def mode_farm(session, user_id, args):
 
 
 def mode_update_library(session, user_id, args):
-    """Atualiza URLs da biblioteca.
+    """Atualiza URLs da biblioteca em paralelo.
 
-    Fast-path: detecta PT apenas no PRIMEIRO episódio do anime.
+    Fast-path por anime: detecta PT apenas no PRIMEIRO episódio (1 GET).
       • PT encontrado → POST PlaybackInfo com AudioStreamIndex=PT em cada ep
       • Só japonês    → monta URL direto (AudioStreamIndex=1) sem chamada extra
     """
@@ -645,58 +635,60 @@ def mode_update_library(session, user_id, args):
         print("  biblioteca vazia."); return
     total_animes = len(lib["animes"])
     print(f"  {total_animes} animes na biblioteca\n")
+
+    lock = threading.Lock()
     ok = fail = 0
 
-    for i, anime in enumerate(lib["animes"], 1):
+    def _update_anime(item):
+        i, anime = item
         name = anime["name"]
         eps  = anime["episodes"]
         tag_prefix = f"  [{i:>4}/{total_animes}] {name}"
 
-        # ── coleta item_ids válidos ───────────────────────────────────────────
-        ep_ids = []
-        for ep in eps:
-            iid = item_id_from_url(ep["url"])
-            if iid:
-                ep_ids.append((ep, iid))
+        ep_ids = [(ep, item_id_from_url(ep["url"])) for ep in eps]
+        ep_ids = [(ep, iid) for ep, iid in ep_ids if iid]
 
         if not ep_ids:
             print(f"{tag_prefix}  — sem eps", flush=True)
-            fail += 1
-            continue
+            return False
 
-        # ── detecta PT no primeiro episódio (1 GET apenas) ───────────────────
-        first_id = ep_ids[0][1]
-        pt_idx   = _detect_pt_index(session, first_id)
+        # 1 GET para detectar PT no primeiro ep
+        pt_idx = _detect_pt_index(session, ep_ids[0][1])
 
         if pt_idx is not None:
-            audio_label = f"🇧🇷 PT encontrado (idx={pt_idx}) → padrão PT"
+            label = f"🇧🇷 PT (idx={pt_idx}) → padrão PT"
         else:
-            audio_label = "🇯🇵 só japonês → padrão japonês"
+            label = "🇯🇵 só japonês"
 
-        print(f"{tag_prefix}  {audio_label}  ({len(ep_ids)} eps)", flush=True)
+        print(f"{tag_prefix}  {label}  ({len(ep_ids)} eps)", flush=True)
 
-        # ── atualiza cada episódio ────────────────────────────────────────────
         for ep, item_id in ep_ids:
             play_session = secrets.token_hex(16)
             iid          = dash(item_id)
-
             if pt_idx is not None:
-                # precisa de MediaSourceId específico para o áudio PT
                 msid, tag, _ = _playback_info_post(session, user_id, iid, audio_idx=pt_idx)
                 msid = (msid or item_id).replace("-", "")
                 aidx = pt_idx
             else:
-                # fast-path: sem PlaybackInfo, japonês padrão
                 msid = item_id.replace("-", "")
                 tag  = ""
                 aidx = 1
-
             ep["url"] = build_url(item_id, msid, args.api_key, play_session, tag, aidx)
 
-        ok += 1
+        return True
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(_update_anime, (i, a)): a
+                   for i, a in enumerate(lib["animes"], 1)}
+        for fut in as_completed(futures):
+            with lock:
+                if fut.result():
+                    ok += 1
+                else:
+                    fail += 1
 
     flush_library(lib)
-    print(f"\n  update: {ok} ok  {fail} falhou  →  {LIBRARY_FILE}")
+    print(f"\n  update: {ok} ok  {fail} sem eps  →  {LIBRARY_FILE}")
 
 
 def mode_fix_names():
