@@ -754,6 +754,39 @@ def mode_update_library(session, user_id, args):
     print(f"\n  update: {ok} ok  {fail} sem eps  →  {LIBRARY_FILE}")
 
 
+def mode_patch_logos(session, user_id):
+    """Preenche logo_url nos animes da biblioteca que ainda não têm o campo."""
+    lib = load_library()
+    if not lib["animes"]:
+        print("  biblioteca vazia."); return
+
+    sem_logo = [a for a in lib["animes"] if not a.get("logo_url")]
+    print(f"  {len(lib['animes'])} animes na biblioteca  →  {len(sem_logo)} sem logo_url\n")
+    if not sem_logo:
+        print("  todos já têm logo_url."); return
+
+    # puxa catálogo completo com ImageTags (1 chamada paginada)
+    all_series = get_all_series(session, user_id)
+    # índice nome→item (lowercase)
+    idx = {s["Name"].lower(): s for s in all_series}
+
+    patched = 0
+    for anime in lib["animes"]:
+        if anime.get("logo_url"):
+            continue
+        serie = idx.get(anime["name"].lower())
+        url   = logo_url(serie) if serie else ""
+        anime["logo_url"] = url
+        if url:
+            print(f"  ✓ {anime['name']}")
+            patched += 1
+        else:
+            anime["logo_url"] = ""   # garante que o campo existe mesmo vazio
+
+    flush_library(lib)
+    print(f"\n  logos adicionadas: {patched}  →  {LIBRARY_FILE}")
+
+
 def mode_fix_names():
     lib = load_library()
     if not lib["animes"]:
@@ -882,7 +915,7 @@ def main():
     p.add_argument("--pull-github", action="store_true",
                    help="baixa a biblioteca atual do GitHub antes de rodar (para uso no Render)")
     p.add_argument("--mode",
-        choices=["scrap","all","farm","update-library","import-jsons","fix-names"],
+        choices=["scrap","all","farm","update-library","import-jsons","fix-names","patch-logos"],
         default=None)
     args = p.parse_args()
 
@@ -895,14 +928,26 @@ def main():
         print("  [4] Atualizar bib  — renova todos os links")
         print("  [5] Importar JSONs — absorve JSONs avulsos da pasta")
         print("  [6] Corrigir nomes — corrige títulos via AniList")
-        choice = input("\n  escolha (1-6): ").strip()
+        print("  [7] Patch logos    — preenche logo_url em toda a biblioteca")
+        choice = input("\n  escolha (1-7): ").strip()
         args.mode = {"1":"scrap","2":"all","3":"farm","4":"update-library",
-                     "5":"import-jsons","6":"fix-names"}.get(choice, "scrap")
+                     "5":"import-jsons","6":"fix-names","7":"patch-logos"}.get(choice, "scrap")
 
     if args.mode == "import-jsons":
         mode_scrap_legacy_jsons(); sys.exit(0)
     if args.mode == "fix-names":
         mode_fix_names(); sys.exit(0)
+    if args.mode == "patch-logos":
+        if args.pull_github:
+            print("  baixando biblioteca do GitHub…"); pull_from_github()
+        s = make_session(args.api_key)
+        user_id = args.user_id or get_user_id(s)
+        if not user_id:
+            print("  não consegui resolver o UserId."); sys.exit(1)
+        mode_patch_logos(s, user_id)
+        if args.github_token:
+            print("\n  enviando para o GitHub…"); push_to_github(args.github_token)
+        sys.exit(0)
 
     if args.mode == "scrap" and not args.anime:
         args.anime = input("  nome do anime: ").strip()
@@ -927,7 +972,7 @@ def main():
     elif args.mode == "update-library": mode_update_library(s, user_id, args)
 
     # push automático ao GitHub se token disponível
-    if args.github_token and args.mode in ("all", "farm", "update-library", "scrap"):
+    if args.github_token and args.mode in ("all", "farm", "update-library", "scrap", "patch-logos"):
         print("\n  enviando para o GitHub…")
         push_to_github(args.github_token)
 
