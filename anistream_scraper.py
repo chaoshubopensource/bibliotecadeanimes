@@ -377,17 +377,28 @@ def _detect_pt_streams(session, item_id):
             params={"Fields": "MediaStreams"},
             timeout=(5, 15),
         )
-        if r.ok:
-            data = r.json()
-            streams = data.get("MediaStreams") or []
-            if not streams:
-                for src in data.get("MediaSources", []):
-                    streams = src.get("MediaStreams") or []
-                    if streams:
-                        break
-            return _best_audio_index(streams), _best_subtitle_index(streams)
-    except Exception:
-        pass
+        if r.status_code in (401, 403):
+            print(f"  ✗ CREDENCIAIS INVÁLIDAS ({r.status_code}) — verifique --api-key e --user-id", flush=True)
+            return None, None
+        if not r.ok:
+            print(f"  ⚠ detect {iid}: HTTP {r.status_code}", flush=True)
+            return None, None
+        data = r.json()
+        streams = data.get("MediaStreams") or []
+        if not streams:
+            for src in data.get("MediaSources", []):
+                streams = src.get("MediaStreams") or []
+                if streams:
+                    break
+        audio_idx = _best_audio_index(streams)
+        sub_idx   = _best_subtitle_index(streams)
+        if audio_idx is not None:
+            print(f"  🇧🇷 BR encontrado (áudio idx={audio_idx}"
+                  + (f", legenda idx={sub_idx}" if sub_idx is not None else "")
+                  + ")", flush=True)
+        return audio_idx, sub_idx
+    except Exception as e:
+        print(f"  ⚠ detect erro {iid}: {e}", flush=True)
     return None, None
 
 
