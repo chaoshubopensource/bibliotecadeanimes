@@ -709,15 +709,24 @@ def mode_update_library(session, user_id, args):
                 tag  = ""
                 aidx = 1
             ep["url"] = build_url(item_id, msid, args.api_key, play_session, tag, aidx)
-            # legenda PT
+            # legenda PT — baixa texto VTT e armazena inline (evita CORS no player)
             if pt_sub is not None:
-                ep["sub"] = (
+                vtt_url = (
                     f"{BASE}/Videos/{iid}/{msid}"
                     f"/Subtitles/{pt_sub}/0/Stream.vtt"
                     f"?ApiKey={args.api_key}"
                 )
+                try:
+                    rv = session.get(vtt_url, timeout=(5, 30))
+                    txt = rv.text if rv.ok else ""
+                    if txt.strip()[:6] == "WEBVTT":
+                        ep["sub"] = txt          # texto VTT inline
+                    else:
+                        ep.pop("sub", None)
+                except Exception:
+                    ep.pop("sub", None)
             else:
-                ep.pop("sub", None)   # remove campo legado se não há mais legenda
+                ep.pop("sub", None)
 
         return True
 
