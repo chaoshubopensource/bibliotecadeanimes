@@ -18,6 +18,16 @@ jobs:
       - name: Instalar dependências
         run: pip install requests urllib3
 
+      - name: Patch logos (preenche logo_url nos animes sem o campo)
+        env:
+          ANISTREAM_API_KEY: ${{ secrets.ANISTREAM_API_KEY }}
+          ANISTREAM_USER_ID: ${{ secrets.ANISTREAM_USER_ID }}
+        run: |
+          python anistream_scraper.py \
+            --api-key "$ANISTREAM_API_KEY" \
+            --user-id "$ANISTREAM_USER_ID" \
+            --mode patch-logos
+
       - name: Rodar scraper
         env:
           ANISTREAM_API_KEY: ${{ secrets.ANISTREAM_API_KEY }}
