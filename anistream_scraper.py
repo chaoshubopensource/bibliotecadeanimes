@@ -13,8 +13,8 @@ KNOWN_DEVICE_ID = "a9d0ebde-e77e-48d6-a6ee-cbfa9c991c1f"
 # AudioStreamIndex é definido dinamicamente por get_playback_info()
 # VideoBitrate baixado para 8 Mbps — força transcode pelo Jellyfin (resolve áudio AC3→AAC na maioria dos casos)
 STREAM_BASE     = (
-    "VideoCodec=hevc,h264&AudioCodec=aac"
-    "&VideoBitrate=8000000&AudioBitrate=192000"
+    "VideoCodec=hevc,h264&AudioCodec=copy"
+    "&VideoBitrate=19469898&AudioBitrate=192000&AudioSampleRate=48000"
     "&MaxFramerate=23.976025&SegmentContainer=ts&MinSegments=2"
     "&TranscodingMaxAudioChannels=6&RequireAvc=false"
     "&EnableAudioVbrEncoding=true&VideoStreamIndex=0"
