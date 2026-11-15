@@ -231,7 +231,7 @@ def get_all_series(session, user_id):
         data = api_get(session, f"/Users/{user_id}/Items",
                        IncludeItemTypes="Series,Movie",
                        Recursive="true",
-                       Fields="Genres,Tags,OfficialRating,ProductionYear,Overview",
+                       Fields="Genres,Tags,OfficialRating,ProductionYear,Overview,ImageTags",
                        SortBy="SortName",
                        SortOrder="Ascending",
                        Limit=batch,
@@ -246,6 +246,14 @@ def get_all_series(session, user_id):
     return all_items
 
 MAX_EPS = 2000   # nenhum anime real tem mais que isso; acima = dado corrompido no Jellyfin
+
+def logo_url(serie):
+    """Monta a URL da logo do anime se disponível, senão retorna ''."""
+    tag = (serie.get("ImageTags") or {}).get("Logo")
+    if not tag:
+        return ""
+    return f"{BASE}/Items/{serie['Id']}/Images/Logo?tag={tag}&fillWidth=1344&fillHeight=256&quality=75"
+
 
 def get_episodes(session, user_id, series_id):
     all_eps, start, batch = [], 0, 1000
@@ -564,7 +572,7 @@ def _run_parallel(session, user_id, args, pendentes, lib, label="all"):
                 print(f"  {tag} {name}{year}  — sem eps")
                 skip += 1
             else:
-                anime = {"id": new_uid(), "name": name, "poster": "", "episodes": ep_list}
+                anime = {"id": new_uid(), "name": name, "poster": "", "logo_url": logo_url(serie), "episodes": ep_list}
                 n_bib = queue_anime(lib, anime)
                 ok += 1
                 print(f"  {tag} {name}{year}  → {len(ep_list)} eps  (biblioteca: {n_bib})")
@@ -585,7 +593,7 @@ def _run_parallel(session, user_id, args, pendentes, lib, label="all"):
                 else:
                     ep_list = scrape_serie(session, user_id, serie["Id"], name, args.api_key, args.no_tag)
                 if ep_list:
-                    anime = {"id": new_uid(), "name": name, "poster": "", "episodes": ep_list}
+                    anime = {"id": new_uid(), "name": name, "poster": "", "logo_url": logo_url(serie), "episodes": ep_list}
                     lib["animes"].append(anime)
                     flush_library(lib)
                     print(f"  ✓ {name}{year}  → {len(ep_list)} eps")
@@ -605,7 +613,7 @@ def mode_scrap(session, user_id, args):
     data = api_get(session, f"/Users/{user_id}/Items",
                    searchTerm=args.anime,
                    IncludeItemTypes="Series",
-                   Fields="Genres,Tags,OfficialRating,ProductionYear",
+                   Fields="Genres,Tags,OfficialRating,ProductionYear,ImageTags",
                    Recursive="true", Limit=50)
     results = data.get("Items", [])
     if not results:
@@ -625,7 +633,7 @@ def mode_scrap(session, user_id, args):
     if not ep_list:
         print("  sem episódios."); return
     lib["animes"] = [a for a in lib["animes"] if a["name"].lower() != chosen["Name"].lower()]
-    lib["animes"].append({"id": new_uid(), "name": chosen["Name"], "poster": "", "episodes": ep_list})
+    lib["animes"].append({"id": new_uid(), "name": chosen["Name"], "poster": "", "logo_url": logo_url(chosen), "episodes": ep_list})
     flush_library(lib)
     total = sum(len(a["episodes"]) for a in lib["animes"])
     print(f"  {chosen['Name']} → {len(ep_list)} eps  |  biblioteca: {len(lib['animes'])} animes / {total} eps")
