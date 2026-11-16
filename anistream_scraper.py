@@ -88,6 +88,21 @@ def _api_post(endpoint: str, json_payload: Dict, **kwargs) -> requests.Response:
     return requests.post(url, headers=_headers(api_key), json=json_payload, timeout=REQUEST_TIMEOUT)
 
 
+def _check(resp: requests.Response, what: str) -> None:
+    """raise_for_status com diagnóstico: status, servidor e trecho do corpo (nunca imprime a chave)."""
+    if resp.status_code < 400:
+        return
+    h = resp.headers
+    via_cf = " | cf-ray presente (resposta via Cloudflare)" if h.get("CF-RAY") else ""
+    print(f"[ERROR] HTTP {resp.status_code} em {what} | server={h.get('Server', '?')} | "
+          f"content-type={h.get('Content-Type', '?')}{via_cf}")
+    print(f"[ERROR] corpo: {resp.text[:300]!r}")
+    if resp.status_code in (401, 403):
+        print("[HINT] Confira ANISTREAM_API_KEY/ANISTREAM_USER_ID, as permissões desse usuário no Jellyfin "
+              "ou bloqueio por IP/WAF (corpo em HTML + cf-ray indica bloqueio do Cloudflare).")
+    resp.raise_for_status()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FUNÇÕES DE MÍNIMA UTILIDADE
 # ──────────────────────────────────────────────────────────────────────────────
@@ -133,7 +148,7 @@ def get_all_series(user_id: str, api_key: str) -> List[Dict]:
             "Limit": PAGE_SIZE,
         }
         resp = _api_get(f"/Users/{user_id}/Items", params=params, apikey=api_key)
-        resp.raise_for_status()
+        _check(resp, "listagem de séries (/Users/<id>/Items)")
         data = resp.json()
         page = data.get("Items", [])
         items.extend(page)
@@ -166,7 +181,7 @@ def get_episodes(serie_id: str, user_id: str, api_key: str) -> List[Dict]:
             "Limit": PAGE_SIZE,
         }
         resp = _api_get(f"/Users/{user_id}/Items", params=params, apikey=api_key)
-        resp.raise_for_status()
+        _check(resp, f"listagem de episódios de {serie_id}")
         data = resp.json()
         page = data.get("Items", [])
         episodes.extend(page)
@@ -256,7 +271,7 @@ def _playback_info_post(item_id: str, api_key: str, audio_stream_index: int) -> 
         "IsPlayback": True
     }
     resp = _api_post(f"/Items/{item_id}/PlaybackInfo", json_payload=payload, apikey=api_key)
-    resp.raise_for_status()
+    _check(resp, f"PlaybackInfo de {item_id}")
     data = resp.json()
 
     media_sources = data.get("MediaSources", [])
