@@ -264,11 +264,13 @@ def _is_pt(stream: Dict) -> bool:
     return False
 
 
-def _detect_pt_streams(item_id: str, api_key: str) -> Optional[Tuple[int, int]]:
+def _detect_pt_streams(item_id: str, api_key: str, user_id: str = "") -> Optional[Tuple[int, int]]:
     """Retorna (audio_idx, sub_idx) — -1 quando a faixa não existe — ou None em caso de falha.
     Printa erro explícito em caso de falha HTTP/autenticação/rede."""
     try:
-        resp = _api_get(f"/Items/{item_id}?Fields=MediaStreams", apikey=api_key)
+        endpoint = (f"/Users/{user_id}/Items/{item_id}?Fields=MediaStreams"
+                    if user_id else f"/Items/{item_id}?Fields=MediaStreams")
+        resp = _api_get(endpoint, apikey=api_key)
     except requests.RequestException as e:
         print(f"[ERROR] Falha de rede ao buscar streams do item {item_id}: {e}")
         return None
@@ -395,11 +397,11 @@ def poster_url(serie: Dict) -> str:
     return _image_url(serie, "Primary", "fillWidth=400&quality=85")
 
 
-def _resolve_episode(ep_id: str, api_key: str) -> Optional[Dict]:
+def _resolve_episode(ep_id: str, api_key: str, user_id: str = "") -> Optional[Dict]:
     """Detecta streams PT, consulta PlaybackInfo e monta {"url", "sub"}. None se falhar."""
     _STATE["auth_fail"] = False
     ep_id = _clean_id(ep_id)
-    streams = _detect_pt_streams(ep_id, api_key)
+    streams = _detect_pt_streams(ep_id, api_key, user_id)
     if streams is None:
         return None
     audio_idx, sub_idx = streams
@@ -541,7 +543,7 @@ def scrape_anime(serie_id: str, serie_data: Dict, api_key: str, user_id: str) ->
 
     episodes = []
     for i, ep in enumerate(episodes_raw):
-        resolved = _resolve_episode(ep["Id"], api_key)
+        resolved = _resolve_episode(ep["Id"], api_key, user_id)
         if not resolved:
             continue
         episodes.append({
@@ -612,7 +614,7 @@ def mode_update_library(api_key: str, user_id: str = ""):
                     eps_fail += 1
                     sem_id += 1
                     continue
-                resolved = _resolve_episode(ep["id"], api_key)
+                resolved = _resolve_episode(ep["id"], api_key, user_id)
                 if not resolved:
                     eps_fail += 1
                     # só falhas 401/403 contam para o abort; episódio removido/sem áudio não
