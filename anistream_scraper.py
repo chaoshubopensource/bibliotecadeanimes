@@ -91,6 +91,7 @@ def _headers(api_key: str) -> Dict[str, str]:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/130.0.0.0 Safari/537.36"
         ),
+        "X-Emby-Token": api_key,  # header equivalente ao Token= (alguns proxies só repassam um dos dois)
         "Accept": "application/json",
         "Connection": "close",
     }
@@ -114,6 +115,16 @@ def _api_get(endpoint: str, params: Optional[Dict] = None, **kwargs) -> requests
                 requests.exceptions.Timeout) as exc:
             last_exc = exc
             continue
+        if resp.status_code == 401:
+            # Fallback: alguns proxies/WAFs removem os headers de auth; tenta a chave via query string.
+            try:
+                sep = "&" if "?" in url else "?"
+                resp2 = requests.get(f"{url}{sep}{urlencode({'api_key': api_key})}",
+                                     headers=_headers(api_key), timeout=REQUEST_TIMEOUT, stream=False)
+                if resp2.status_code != 401:
+                    return resp2
+            except requests.exceptions.RequestException:
+                pass
         if resp.status_code in RETRY_STATUS and attempt < 4:
             last_exc = f"HTTP {resp.status_code}"
             continue
@@ -438,6 +449,78 @@ def is_nsfw(serie_meta: Dict) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 # MODOS DE OPERAÇÃO
 # ──────────────────────────────────────────────────────────────────────────────
+def _is_full_id(raw_id: Optional[str]) -> bool:
+    """IDs do Jellyfin têm 32 caracteres hex. Menos que isso = ID truncado (biblioteca antiga)."""
+    return bool(raw_id) and len(raw_id) >= 32
+
+
+def _find_full(short: str, candidates: List[str]) -> Optional[str]:
+    """Acha o ID completo de um ID truncado (prefixo ou sufixo). Só aceita se o match for único."""
+    s = (short or "").lower()
+    if not s:
+        return None
+    for test in (str.startswith, str.endswith):
+        hits = [c for c in candidates if test(c.lower(), s)]
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
+def _ensure_full_ids(lib: Dict, user_id: str, api_key: str) -> int:
+    """Repara IDs truncados (anime e episódios) consultando o Jellyfin. Só faz requisições se
+    existir algum ID curto. Retorna quantos IDs foram corrigidos."""
+    def _short(i: Optional[str]) -> bool:
+        return not _is_full_id(_clean_id(i or ""))
+
+    precisa = any(_short(a.get("id")) or any(_short(e.get("id")) for e in a.get("episodes", []))
+                  for a in lib["animes"])
+    if not precisa:
+        return 0
+    if not user_id:
+        print("[WARN] Biblioteca tem IDs truncados, mas ANISTREAM_USER_ID não foi informado: "
+              "não é possível repará-los.")
+        return 0
+
+    print("[INFO] IDs truncados detectados na biblioteca. Reconstruindo IDs completos via Jellyfin...")
+    all_series = get_all_series(user_id, api_key)
+    series_ids = [s["id"] for s in all_series]
+    by_name: Dict[str, List[str]] = {}
+    for s in all_series:
+        by_name.setdefault(_norm(s["name"]), []).append(s["id"])
+
+    fixed = unresolved = 0
+    for anime in lib["animes"]:
+        aid = _clean_id(anime.get("id") or "")
+        if _short(aid):
+            full = _find_full(aid, series_ids)
+            if not full:
+                nomes = by_name.get(_norm(anime.get("name")), [])
+                full = nomes[0] if len(nomes) == 1 else None
+            if not full:
+                unresolved += 1
+                continue
+            anime["id"] = full
+            fixed += 1
+        else:
+            full = aid
+
+        if any(_short(e.get("id")) for e in anime.get("episodes", [])):
+            try:
+                eps = get_episodes(full, user_id, api_key)
+            except requests.RequestException as e:
+                print(f"[WARN] Não foi possível listar episódios de '{anime.get('name')}' para reparar IDs: {e}")
+                continue
+            cands = [e["Id"] for e in eps] + [full]  # filme: o episódio é o próprio item
+            for ep in anime.get("episodes", []):
+                if _short(ep.get("id")):
+                    f = _find_full(_clean_id(ep.get("id") or ""), cands)
+                    if f:
+                        ep["id"] = f
+                        fixed += 1
+    print(f"[INFO] IDs reparados: {fixed} | animes sem correspondência: {unresolved}.")
+    return fixed
+
+
 def scrape_anime(serie_id: str, serie_data: Dict, api_key: str, user_id: str) -> Optional[Dict]:
     meta = serie_data["metadata"]
     nome = meta.get("Name", "Unknown")
@@ -487,6 +570,7 @@ def scrape_anime(serie_id: str, serie_data: Dict, api_key: str, user_id: str) ->
 def mode_all(api_key: str, user_id: str, limit: int = 0):
     print("[INFO] Iniciando modo ALL (incremental)...")
     lib = load_library()
+    _ensure_full_ids(lib, user_id, api_key)  # sem isso, IDs truncados fariam tudo ser re-raspado e duplicado
     # a biblioteca é a fonte da verdade (CI não persiste arquivos locais); IDs legados "id-" normalizados
     known = {_clean_id(a["id"]) for a in lib["animes"]}
     all_series = get_all_series(user_id, api_key)
@@ -508,9 +592,14 @@ def mode_all(api_key: str, user_id: str, limit: int = 0):
     print(f"[DONE] Novo(s) anime(s): {new_count}. Biblioteca salva.")
 
 
-def mode_update_library(api_key: str):
+def mode_update_library(api_key: str, user_id: str = ""):
     print("[INFO] Iniciando UPDATE-LIBRARY (renova URLs)...")
     lib = load_library()
+    sem_id = 0
+    try:
+        _ensure_full_ids(lib, user_id, api_key)  # repara IDs truncados (causa do HTTP 400 "itemId not valid")
+    except requests.RequestException as e:
+        print(f"[WARN] Falha ao reparar IDs truncados: {e}")
     total = len(lib["animes"])
     eps_ok = eps_fail = 0
     falhas_auth_seguidas = 0
@@ -518,6 +607,11 @@ def mode_update_library(api_key: str):
     try:
         for n, anime in enumerate(lib["animes"], 1):
             for ep in anime.get("episodes", []):
+                if not _is_full_id(_clean_id(ep.get("id") or "")):
+                    # ID truncado sem correspondência: nem adianta pedir ao servidor (daria HTTP 400)
+                    eps_fail += 1
+                    sem_id += 1
+                    continue
                 resolved = _resolve_episode(ep["id"], api_key)
                 if not resolved:
                     eps_fail += 1
@@ -538,6 +632,9 @@ def mode_update_library(api_key: str):
             if n % 10 == 0: print(f"[PROGRESS] {n}/{total}")
     finally:
         save_library(lib)
+    if sem_id:
+        print(f"[WARN] {sem_id} episódios com ID truncado não puderam ser reparados "
+              "(rode --mode scrap --anime <nome> para re-raspar esses animes).")
     print(f"[DONE] {eps_ok} episódios renovados em {total} animes ({eps_fail} falhas).")
 
 
@@ -601,6 +698,7 @@ def mode_scrap(api_key: str, user_id: str, name: str):
         return
 
     lib = load_library()
+    _ensure_full_ids(lib, user_id, api_key)
     for i, a in enumerate(lib["animes"]):
         if _clean_id(a["id"]) == result["id"]:
             lib["animes"][i] = result  # re-scrap substitui (inclusive entrada com ID legado "id-"), não duplica
@@ -613,6 +711,7 @@ def mode_scrap(api_key: str, user_id: str, name: str):
 
 def mode_farm(api_key: str, user_id: str, count: int = 5):
     lib = load_library()
+    _ensure_full_ids(lib, user_id, api_key)
     known = {_clean_id(a["id"]) for a in lib["animes"]}
     available = [s for s in get_all_series(user_id, api_key)
                  if s["id"] not in known and not is_nsfw(s["metadata"])]
@@ -687,8 +786,9 @@ def main():
         parser.error("--mode scrap requer --anime")
 
     # Argumento de linha de comando tem prioridade; senão usa a variável de ambiente.
-    api_key = args.api_key or os.environ.get("ANISTREAM_API_KEY", "")
-    user_id = args.user_id or os.environ.get("ANISTREAM_USER_ID", "")
+    # strip(): secrets colados no GitHub costumam vir com espaço/quebra de linha no fim
+    api_key = (args.api_key or os.environ.get("ANISTREAM_API_KEY", "")).strip().strip('"').strip("'")
+    user_id = (args.user_id or os.environ.get("ANISTREAM_USER_ID", "")).strip().strip('"').strip("'")
 
     # Cada modo exige apenas as credenciais que realmente usa.
     needs_key = args.mode not in ("import-jsons", "fix-names")
@@ -709,7 +809,7 @@ def main():
 
     routes = {
         "all": lambda: mode_all(api_key, user_id, args.limit),
-        "update-library": lambda: mode_update_library(api_key),
+        "update-library": lambda: mode_update_library(api_key, user_id),
         "patch-logos": lambda: mode_patch_logos(api_key, user_id),
         "scrap": lambda: mode_scrap(api_key, user_id, args.anime),
         "farm": lambda: mode_farm(api_key, user_id, args.farm_count),
