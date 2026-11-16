@@ -82,16 +82,28 @@ def _headers(api_key: str) -> Dict[str, str]:
             "Chrome/130.0.0.0 Safari/537.36"
         ),
         "Accept": "application/json",
-        "Connection": "keep-alive",
+        "Connection": "close",
     }
 
 
 def _api_get(endpoint: str, params: Optional[Dict] = None, **kwargs) -> requests.Response:
+    import time
     url = f"{BASE_URL}{endpoint}"
     if params:
         url += f"?{urlencode(params)}"
     api_key = kwargs.pop("apikey", None) or os.environ["ANISTREAM_API_KEY"]
-    return requests.get(url, headers=_headers(api_key), timeout=REQUEST_TIMEOUT)
+    last_exc: Optional[Exception] = None
+    for attempt in range(5):
+        if attempt:
+            wait = 2 ** attempt
+            print(f"[RETRY] tentativa {attempt + 1}/5 após {wait}s ({last_exc})")
+            time.sleep(wait)
+        try:
+            resp = requests.get(url, headers=_headers(api_key), timeout=REQUEST_TIMEOUT, stream=False)
+            return resp
+        except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as exc:
+            last_exc = exc
+    raise RuntimeError(f"[FATAL] falhou após 5 tentativas: {last_exc}")
 
 
 def _api_post(endpoint: str, json_payload: Dict, **kwargs) -> requests.Response:
