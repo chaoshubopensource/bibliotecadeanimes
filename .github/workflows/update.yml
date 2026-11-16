@@ -1,4 +1,4 @@
-name: Atualizar Biblioteca Gulosa
+name: Atualizar Biblioteca
 
 on:
   schedule:
@@ -28,7 +28,7 @@ jobs:
             --user-id "$ANISTREAM_USER_ID" \
             --mode patch-logos
 
-      - name: Rodar scraper
+      - name: Sync (novos animes + episodios novos)
         env:
           ANISTREAM_API_KEY: ${{ secrets.ANISTREAM_API_KEY }}
           ANISTREAM_USER_ID: ${{ secrets.ANISTREAM_USER_ID }}
@@ -36,7 +36,7 @@ jobs:
           python anistream_scraper.py \
             --api-key "$ANISTREAM_API_KEY" \
             --user-id "$ANISTREAM_USER_ID" \
-            --mode update-library
+            --mode sync
 
       - name: Commitar e enviar JSON atualizado
         run: |
