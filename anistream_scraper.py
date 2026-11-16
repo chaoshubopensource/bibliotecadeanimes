@@ -327,7 +327,16 @@ def _image_url(serie: Dict, kind: str, size_qs: str) -> str:
 
 
 def logo_url(serie: Dict) -> str:
-    return _image_url(serie, "Logo", "fillWidth=1344&fillHeight=256&quality=75")
+    """Gera URL de logo sem depender de ImageTags.Logo (nem sempre vem na listagem).
+    O servidor retorna 404 silencioso se a logo não existir — o frontend trata com onerror."""
+    meta = serie.get("metadata", serie)
+    item_id = serie.get("id") or meta.get("Id") or ""
+    if not item_id:
+        return ""
+    # usa tag se disponível (cache-busting), senão manda sem — funciona do mesmo jeito
+    tag = (meta.get("ImageTags") or {}).get("Logo")
+    qs = f"tag={tag}&" if tag else ""
+    return f"{BASE_URL}/Items/{item_id}/Images/Logo?{qs}fillWidth=1344&fillHeight=256&quality=75"
 
 
 def poster_url(serie: Dict) -> str:
