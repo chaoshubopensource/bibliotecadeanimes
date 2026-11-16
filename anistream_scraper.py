@@ -569,6 +569,88 @@ def scrape_anime(serie_id: str, serie_data: Dict, api_key: str, user_id: str) ->
     }
 
 
+def mode_sync(api_key: str, user_id: str):
+    """Modo inteligente: adiciona animes/episódios novos E renova URLs de quem mudou.
+    Lógica:
+      - Anime novo no Jellyfin → raspa completo
+      - Anime existente com contagem de eps diferente → raspa só os eps novos, mantém os velhos
+      - Anime existente sem mudança → pula (zero requests extras)
+    Muito mais rápido que update-library pois só faz requests quando há mudança real."""
+    print("[INFO] Iniciando SYNC (novos animes + episódios novos)...")
+    lib = load_library()
+    _ensure_full_ids(lib, user_id, api_key)
+    save_library(lib)  # persiste IDs reparados antes de qualquer erro
+
+    all_series = get_all_series(user_id, api_key)
+    by_id = {s["id"]: s for s in all_series}
+
+    # índice rápido da biblioteca
+    lib_by_id: Dict[str, Dict] = {_clean_id(a["id"]): a for a in lib["animes"]}
+
+    novos = atualizados = sem_mudanca = 0
+
+    try:
+        for s in all_series:
+            sid = s["id"]
+            anime_salvo = lib_by_id.get(sid)
+
+            if anime_salvo is None:
+                # ── anime novo ──────────────────────────────────────────────
+                if is_nsfw(s["metadata"]):
+                    continue
+                result = scrape_anime(sid, s, api_key, user_id)
+                if result:
+                    lib["animes"].append(result)
+                    lib_by_id[sid] = result
+                    novos += 1
+                    print(f"[NEW] {result['name']} ({len(result['episodes'])} eps)")
+                    if novos % 5 == 0: save_library(lib)
+                continue
+
+            # ── anime existente: compara contagem de episódios ───────────────
+            try:
+                eps_jellyfin = get_episodes(sid, user_id, api_key)
+            except requests.RequestException as e:
+                print(f"[WARN] Falha ao listar eps de '{anime_salvo.get('name')}': {e}")
+                continue
+
+            eps_salvas = {_clean_id(e["id"]) for e in anime_salvo.get("episodes", [])}
+            eps_novos = [ep for ep in eps_jellyfin if ep["Id"] not in eps_salvas]
+
+            if not eps_novos:
+                sem_mudanca += 1
+                continue
+
+            # raspa só os episódios que faltam
+            print(f"[UPDATE] {anime_salvo.get('name')}: {len(eps_novos)} ep(s) novo(s)")
+            adicionados = 0
+            for i, ep in enumerate(eps_jellyfin):
+                if ep["Id"] not in eps_salvas:
+                    resolved = _resolve_episode(ep["Id"], api_key, user_id)
+                    if resolved:
+                        num = str(len(anime_salvo["episodes"]) + adicionados + 1)
+                        anime_salvo.setdefault("episodes", []).append({
+                            "id": ep["Id"],
+                            "num": num,
+                            "url": resolved["url"],
+                            "sub": resolved["sub"],
+                        })
+                        adicionados += 1
+            # atualiza logo/poster se estiver vazio
+            if not anime_salvo.get("logo_url"):
+                anime_salvo["logo_url"] = logo_url(s)
+            if not anime_salvo.get("poster"):
+                anime_salvo["poster"] = poster_url(s)
+            if adicionados:
+                atualizados += 1
+                save_library(lib)
+
+    finally:
+        save_library(lib)
+
+    print(f"[DONE] Novos: {novos} | Atualizados: {atualizados} | Sem mudança: {sem_mudanca}.")
+
+
 def mode_all(api_key: str, user_id: str, limit: int = 0):
     print("[INFO] Iniciando modo ALL (incremental)...")
     lib = load_library()
@@ -776,7 +858,7 @@ def mode_import_jsons(api_key: str):
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="AniStream Scraper & Library Manager")
-    parser.add_argument("--mode", choices=["all", "update-library", "patch-logos", "scrap", "farm", "fix-names", "import-jsons"], required=True)
+    parser.add_argument("--mode", choices=["sync", "all", "update-library", "patch-logos", "scrap", "farm", "fix-names", "import-jsons"], required=True)
     parser.add_argument("--anime", help="Nome exato ou parcial para modo scrap")
     parser.add_argument("--farm-count", type=int, default=5, help="Quantidade para modo farm")
     parser.add_argument("--limit", type=int, default=0, help="Limite de itens para modo all")
@@ -794,7 +876,7 @@ def main():
 
     # Cada modo exige apenas as credenciais que realmente usa.
     needs_key = args.mode not in ("import-jsons", "fix-names")
-    needs_user = args.mode in ("all", "scrap", "farm", "patch-logos")
+    needs_user = args.mode in ("sync", "all", "scrap", "farm", "patch-logos")
     if needs_key and not api_key:
         print("[FATAL] API key ausente: use --api-key ou defina ANISTREAM_API_KEY.")
         sys.exit(1)
@@ -804,12 +886,13 @@ def main():
     if api_key:
         os.environ["ANISTREAM_API_KEY"] = api_key  # mantém compatibilidade com os helpers de API
 
-    if args.mode in ("all", "scrap", "farm") and not any(
+    if args.mode in ("sync", "all", "scrap", "farm") and not any(
             FILTERS[k] for k in ("genres", "tags", "keywords", "title_blocks")):
         print("[WARN] Filtros NSFW vazios (variáveis NSFW_*_B64 ausentes ou inválidas): "
               "NENHUM conteúdo será filtrado nesta execução.")
 
     routes = {
+        "sync": lambda: mode_sync(api_key, user_id),
         "all": lambda: mode_all(api_key, user_id, args.limit),
         "update-library": lambda: mode_update_library(api_key, user_id),
         "patch-logos": lambda: mode_patch_logos(api_key, user_id),
