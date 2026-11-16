@@ -76,6 +76,11 @@ def _headers(api_key: str) -> Dict[str, str]:
             f'MediaBrowser Token="{api_key}", Client="Jellyfin Web", '
             f'Device="Chrome", DeviceId="{DEVICE_ID}", Version="10.9.11"'
         ),
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36"
+        ),
         "Accept": "application/json",
         "Connection": "keep-alive",
     }
