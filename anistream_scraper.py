@@ -204,7 +204,7 @@ def get_all_series(user_id: str, api_key: str) -> List[Dict]:
         params = {
             "IncludeItemTypes": "Series,Movie",
             "Recursive": "true",
-            "Fields": "Genres,Tags,OfficialRating,ProductionYear,Overview,ImageTags",
+            "Fields": "Genres,Tags,OfficialRating,ProductionYear,Overview,ImageTags,ChildCount,RecursiveItemCount",
             "SortBy": "SortName",  # ordem estável, necessária para paginar sem duplicar
             "StartIndex": start,
             "Limit": PAGE_SIZE,
@@ -570,21 +570,15 @@ def scrape_anime(serie_id: str, serie_data: Dict, api_key: str, user_id: str) ->
 
 
 def mode_sync(api_key: str, user_id: str):
-    """Modo inteligente: adiciona animes/episódios novos E renova URLs de quem mudou.
-    Lógica:
-      - Anime novo no Jellyfin → raspa completo
-      - Anime existente com contagem de eps diferente → raspa só os eps novos, mantém os velhos
-      - Anime existente sem mudança → pula (zero requests extras)
-    Muito mais rápido que update-library pois só faz requests quando há mudança real."""
+    """Modo inteligente: adiciona animes/episódios novos sem varrer tudo.
+    Usa RecursiveItemCount da listagem (zero requests extras) pra detectar mudança.
+    Só chama get_episodes quando o contador diverge do que está salvo."""
     print("[INFO] Iniciando SYNC (novos animes + episódios novos)...")
     lib = load_library()
     _ensure_full_ids(lib, user_id, api_key)
-    save_library(lib)  # persiste IDs reparados antes de qualquer erro
+    save_library(lib)
 
     all_series = get_all_series(user_id, api_key)
-    by_id = {s["id"]: s for s in all_series}
-
-    # índice rápido da biblioteca
     lib_by_id: Dict[str, Dict] = {_clean_id(a["id"]): a for a in lib["animes"]}
 
     novos = atualizados = sem_mudanca = 0
@@ -607,7 +601,17 @@ def mode_sync(api_key: str, user_id: str):
                     if novos % 5 == 0: save_library(lib)
                 continue
 
-            # ── anime existente: compara contagem de episódios ───────────────
+            # ── anime existente: compara contagem via RecursiveItemCount ─────
+            # RecursiveItemCount vem de graça na listagem — zero requests extras
+            meta = s["metadata"]
+            count_server = meta.get("RecursiveItemCount") or meta.get("ChildCount") or 0
+            count_local = len(anime_salvo.get("episodes", []))
+
+            if count_server and count_server <= count_local:
+                sem_mudanca += 1
+                continue
+
+            # contagem divergiu: busca eps reais pra saber quais são novos
             try:
                 eps_jellyfin = get_episodes(sid, user_id, api_key)
             except requests.RequestException as e:
@@ -621,22 +625,19 @@ def mode_sync(api_key: str, user_id: str):
                 sem_mudanca += 1
                 continue
 
-            # raspa só os episódios que faltam
             print(f"[UPDATE] {anime_salvo.get('name')}: {len(eps_novos)} ep(s) novo(s)")
             adicionados = 0
-            for i, ep in enumerate(eps_jellyfin):
-                if ep["Id"] not in eps_salvas:
-                    resolved = _resolve_episode(ep["Id"], api_key, user_id)
-                    if resolved:
-                        num = str(len(anime_salvo["episodes"]) + adicionados + 1)
-                        anime_salvo.setdefault("episodes", []).append({
-                            "id": ep["Id"],
-                            "num": num,
-                            "url": resolved["url"],
-                            "sub": resolved["sub"],
-                        })
-                        adicionados += 1
-            # atualiza logo/poster se estiver vazio
+            for ep in eps_novos:
+                resolved = _resolve_episode(ep["Id"], api_key, user_id)
+                if resolved:
+                    num = str(count_local + adicionados + 1)
+                    anime_salvo.setdefault("episodes", []).append({
+                        "id": ep["Id"],
+                        "num": num,
+                        "url": resolved["url"],
+                        "sub": resolved["sub"],
+                    })
+                    adicionados += 1
             if not anime_salvo.get("logo_url"):
                 anime_salvo["logo_url"] = logo_url(s)
             if not anime_salvo.get("poster"):
