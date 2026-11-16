@@ -78,12 +78,14 @@ def _api_get(endpoint: str, params: Optional[Dict] = None, **kwargs) -> requests
     url = f"{BASE_URL}{endpoint}"
     if params:
         url += f"?{urlencode(params)}"
-    return requests.get(url, headers=_headers(kwargs.pop("apikey", os.environ["ANISTREAM_API_KEY"])), timeout=REQUEST_TIMEOUT)
+    api_key = kwargs.pop("apikey", None) or os.environ["ANISTREAM_API_KEY"]
+    return requests.get(url, headers=_headers(api_key), timeout=REQUEST_TIMEOUT)
 
 
 def _api_post(endpoint: str, json_payload: Dict, **kwargs) -> requests.Response:
     url = f"{BASE_URL}{endpoint}"
-    return requests.post(url, headers=_headers(kwargs.pop("apikey", os.environ["ANISTREAM_API_KEY"])), json=json_payload, timeout=REQUEST_TIMEOUT)
+    api_key = kwargs.pop("apikey", None) or os.environ["ANISTREAM_API_KEY"]
+    return requests.post(url, headers=_headers(api_key), json=json_payload, timeout=REQUEST_TIMEOUT)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -572,20 +574,23 @@ def main():
     parser.add_argument("--anime", help="Nome exato ou parcial para modo scrap")
     parser.add_argument("--farm-count", type=int, default=5, help="Quantidade para modo farm")
     parser.add_argument("--limit", type=int, default=0, help="Limite de itens para modo all")
+    parser.add_argument("--api-key", help="API key do Jellyfin (padrão: env ANISTREAM_API_KEY)")
+    parser.add_argument("--user-id", help="User ID do Jellyfin (padrão: env ANISTREAM_USER_ID)")
     args = parser.parse_args()
 
     if args.mode == "scrap" and not args.anime:
         parser.error("--mode scrap requer --anime")
 
-    if not os.environ.get("ANISTREAM_API_KEY"):
-        print("[FATAL] ANISTREAM_API_KEY não definida no ambiente.")
+    # Argumento de linha de comando tem prioridade; senão usa a variável de ambiente.
+    api_key = args.api_key or os.environ.get("ANISTREAM_API_KEY", "")
+    user_id = args.user_id or os.environ.get("ANISTREAM_USER_ID", "")
+    if not api_key:
+        print("[FATAL] API key ausente: use --api-key ou defina ANISTREAM_API_KEY.")
         sys.exit(1)
-    if not os.environ.get("ANISTREAM_USER_ID"):
-        print("[FATAL] ANISTREAM_USER_ID não definida no ambiente.")
+    if not user_id:
+        print("[FATAL] User ID ausente: use --user-id ou defina ANISTREAM_USER_ID.")
         sys.exit(1)
-
-    api_key = os.environ["ANISTREAM_API_KEY"]
-    user_id = os.environ["ANISTREAM_USER_ID"]
+    os.environ["ANISTREAM_API_KEY"] = api_key  # mantém compatibilidade com os helpers de API
 
     if args.mode in ("all", "scrap", "farm") and not any(
             FILTERS[k] for k in ("genres", "tags", "keywords", "title_blocks")):
