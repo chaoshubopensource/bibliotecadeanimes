@@ -38,11 +38,18 @@ STREAM_BASE = {"AudioCodec": "copy"}
 # Idiomas aceitos como português. O Jellyfin costuma usar ISO 639-2 ("por"), não "pt".
 PT_LANGS = {"pt", "por", "pt-br", "ptbr", "pob"}
 
-# Limite de falhas seguidas no update-library antes de abortar (evita gastar a execução inteira).
+# Limite de falhas de AUTENTICAÇÃO (401/403) seguidas no update-library antes de abortar.
+# Falhas legítimas (episódio removido, sem áudio etc.) não contam.
 MAX_FALHAS_SEGUIDAS = 50
 
-# 🔒 SEGURANÇA: Valores base64 devem permanecer codificados no source.
-# Decodificados apenas em memória durante a execução.
+# Status HTTP transitórios (comuns atrás do Cloudflare) que merecem retry.
+RETRY_STATUS = {429, 502, 503, 504}
+
+# Estado interno: indica se a última resolução de episódio falhou por 401/403.
+_STATE = {"auth_fail": False}
+
+# 🔒 SEGURANÇA: as listas NSFW vêm de variáveis de ambiente (base64) e são
+# decodificadas apenas em memória durante a execução.
 NSFW_GENRES_B64 = os.getenv("NSFW_GENRES_B64", "")
 NSFW_TAGS_B64 = os.getenv("NSFW_TAGS_B64", "")
 NSFW_KEYWORDS_B64 = os.getenv("NSFW_KEYWORDS_B64", "")
@@ -90,12 +97,11 @@ def _headers(api_key: str) -> Dict[str, str]:
 
 
 def _api_get(endpoint: str, params: Optional[Dict] = None, **kwargs) -> requests.Response:
-    import time
     url = f"{BASE_URL}{endpoint}"
     if params:
         url += f"?{urlencode(params)}"
     api_key = kwargs.pop("apikey", None) or os.environ["ANISTREAM_API_KEY"]
-    last_exc: Optional[Exception] = None
+    last_exc = None
     for attempt in range(5):
         if attempt:
             wait = 2 ** attempt
@@ -103,10 +109,17 @@ def _api_get(endpoint: str, params: Optional[Dict] = None, **kwargs) -> requests
             time.sleep(wait)
         try:
             resp = requests.get(url, headers=_headers(api_key), timeout=REQUEST_TIMEOUT, stream=False)
-            return resp
-        except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as exc:
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.Timeout) as exc:
             last_exc = exc
-    raise RuntimeError(f"[FATAL] falhou após 5 tentativas: {last_exc}")
+            continue
+        if resp.status_code in RETRY_STATUS and attempt < 4:
+            last_exc = f"HTTP {resp.status_code}"
+            continue
+        return resp
+    # RequestException: os try/except dos chamadores já tratam esse tipo.
+    raise requests.exceptions.ConnectionError(f"falhou após 5 tentativas: {last_exc}")
 
 
 def _api_post(endpoint: str, json_payload: Dict, **kwargs) -> requests.Response:
@@ -141,8 +154,11 @@ def load_library(path: str = LIBRARY_PATH) -> Dict:
 
 
 def save_library(lib: Dict, path: str = LIBRARY_PATH):
-    with open(path, "w", encoding="utf-8") as f:
+    # Escrita atômica: se o processo morrer no meio, o arquivo anterior permanece íntegro.
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(lib, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
 
 
 def _exists_in_lib(anime_id: str, lib: Dict) -> bool:
@@ -156,6 +172,14 @@ def _find_anime_by_id(anime_id: str, lib: Dict) -> Optional[Dict]:
 def _norm(text: Optional[str]) -> str:
     """Normaliza nome para comparação (case-insensitive, espaços colapsados)."""
     return " ".join((text or "").casefold().split())
+
+
+def _clean_id(raw_id: str) -> str:
+    """Remove prefixo 'id-' legado que o scraper antigo adicionava aos IDs do Jellyfin.
+    (Sem str.removeprefix para funcionar em Python < 3.9.)"""
+    if raw_id and raw_id.startswith("id-"):
+        return raw_id[3:]
+    return raw_id
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -239,6 +263,7 @@ def _detect_pt_streams(item_id: str, api_key: str) -> Optional[Tuple[int, int]]:
         return None
 
     if resp.status_code in (401, 403):
+        _STATE["auth_fail"] = True
         print(f"[ERROR] Credenciais inválidas ou permissão negada para /Items/{item_id}. Status: {resp.status_code}")
         return None
     elif resp.status_code != 200:
@@ -337,7 +362,7 @@ def _image_url(serie: Dict, kind: str, size_qs: str) -> str:
     tag = (meta.get("ImageTags") or {}).get(kind)
     if not tag:
         return ""
-    item_id = (serie.get("id") or meta.get("Id") or "").removeprefix("id-")
+    item_id = _clean_id(serie.get("id") or meta.get("Id") or "")
     return f"{BASE_URL}/Items/{item_id}/Images/{kind}?tag={tag}&{size_qs}"
 
 
@@ -346,7 +371,7 @@ def logo_url(serie: Dict) -> str:
     O servidor retorna 404 silencioso se a logo não existir — o frontend trata com onerror."""
     meta = serie.get("metadata", serie)
     item_id = serie.get("id") or meta.get("Id") or ""
-    item_id = item_id.removeprefix("id-")  # remove prefixo legado do scraper antigo
+    item_id = _clean_id(item_id)  # remove prefixo legado do scraper antigo
     if not item_id:
         return ""
     # usa tag se disponível (cache-busting), senão manda sem — funciona do mesmo jeito
@@ -359,13 +384,9 @@ def poster_url(serie: Dict) -> str:
     return _image_url(serie, "Primary", "fillWidth=400&quality=85")
 
 
-def _clean_id(raw_id: str) -> str:
-    """Remove prefixo 'id-' legado que o scraper antigo adicionava aos IDs do Jellyfin."""
-    return raw_id.removeprefix("id-") if raw_id else raw_id
-
-
 def _resolve_episode(ep_id: str, api_key: str) -> Optional[Dict]:
     """Detecta streams PT, consulta PlaybackInfo e monta {"url", "sub"}. None se falhar."""
+    _STATE["auth_fail"] = False
     ep_id = _clean_id(ep_id)
     streams = _detect_pt_streams(ep_id, api_key)
     if streams is None:
@@ -377,7 +398,10 @@ def _resolve_episode(ep_id: str, api_key: str) -> Optional[Dict]:
 
     try:
         playback = _playback_info_post(ep_id, api_key, audio_idx)
-    except requests.RequestException as e:
+    except (requests.RequestException, ValueError) as e:
+        err_resp = getattr(e, "response", None)
+        if err_resp is not None and err_resp.status_code in (401, 403):
+            _STATE["auth_fail"] = True
         print(f"[ERROR] PlaybackInfo falhou para {ep_id}: {e}")
         return None
     if not playback:
@@ -391,13 +415,14 @@ def _resolve_episode(ep_id: str, api_key: str) -> Optional[Dict]:
 # FILTROS & VALIDAÇÃO
 # ──────────────────────────────────────────────────────────────────────────────
 def is_nsfw(serie_meta: Dict) -> bool:
-    name_lower = serie_meta.get("Name", "").lower()
-    genres = [g.lower() for g in serie_meta.get("Genres", [])]
-    tags = [t.lower() for t in serie_meta.get("Tags", [])]
+    # "or" cobre campos presentes mas com valor null no JSON do Jellyfin
+    name_lower = (serie_meta.get("Name") or "").lower()
+    genres = [g.lower() for g in (serie_meta.get("Genres") or [])]
+    tags = [t.lower() for t in (serie_meta.get("Tags") or [])]
 
-    # Whitelist verifica legendas
+    # Whitelist: compara com o título da série
     whitelist_subs = FILTERS.get("whitelist_subs", [])
-    # Se tiver legenda na whitelist, ignora filtro
+    # Se o título contiver um termo da whitelist, ignora filtro
     if whitelist_subs and any(s in name_lower for s in whitelist_subs):
         return False
 
@@ -462,7 +487,8 @@ def scrape_anime(serie_id: str, serie_data: Dict, api_key: str, user_id: str) ->
 def mode_all(api_key: str, user_id: str, limit: int = 0):
     print("[INFO] Iniciando modo ALL (incremental)...")
     lib = load_library()
-    known = {a["id"] for a in lib["animes"]}  # a biblioteca é a fonte da verdade (CI não persiste arquivos locais)
+    # a biblioteca é a fonte da verdade (CI não persiste arquivos locais); IDs legados "id-" normalizados
+    known = {_clean_id(a["id"]) for a in lib["animes"]}
     all_series = get_all_series(user_id, api_key)
 
     new_count = 0
@@ -487,7 +513,7 @@ def mode_update_library(api_key: str):
     lib = load_library()
     total = len(lib["animes"])
     eps_ok = eps_fail = 0
-    falhas_seguidas = 0
+    falhas_auth_seguidas = 0
 
     try:
         for n, anime in enumerate(lib["animes"], 1):
@@ -495,18 +521,19 @@ def mode_update_library(api_key: str):
                 resolved = _resolve_episode(ep["id"], api_key)
                 if not resolved:
                     eps_fail += 1
-                    falhas_seguidas += 1
-                    if falhas_seguidas >= MAX_FALHAS_SEGUIDAS:
-                        raise RuntimeError(
-                            f"{falhas_seguidas} falhas seguidas (401/403 ou bloqueio). "
-                            "Abortando para não gastar a execução inteira. Verifique ANISTREAM_API_KEY, "
-                            "permissões do usuário no Jellyfin e bloqueio por IP/WAF."
-                        )
+                    # só falhas 401/403 contam para o abort; episódio removido/sem áudio não
+                    if _STATE["auth_fail"]:
+                        falhas_auth_seguidas += 1
+                        if falhas_auth_seguidas >= MAX_FALHAS_SEGUIDAS:
+                            raise RuntimeError(
+                                f"{falhas_auth_seguidas} falhas de autenticação (401/403) seguidas. "
+                                "Abortando para não gastar a execução inteira. Verifique ANISTREAM_API_KEY, "
+                                "permissões do usuário no Jellyfin e bloqueio por IP/WAF."
+                            )
                     continue
-                falhas_seguidas = 0
+                falhas_auth_seguidas = 0
                 ep["url"] = resolved["url"]
-                if resolved["sub"]:
-                    ep["sub"] = resolved["sub"]
+                ep["sub"] = resolved["sub"]  # se a legenda sumiu do servidor, limpa a antiga
                 eps_ok += 1
             if n % 10 == 0: print(f"[PROGRESS] {n}/{total}")
     finally:
@@ -575,8 +602,8 @@ def mode_scrap(api_key: str, user_id: str, name: str):
 
     lib = load_library()
     for i, a in enumerate(lib["animes"]):
-        if a["id"] == result["id"]:
-            lib["animes"][i] = result  # re-scrap substitui, não duplica
+        if _clean_id(a["id"]) == result["id"]:
+            lib["animes"][i] = result  # re-scrap substitui (inclusive entrada com ID legado "id-"), não duplica
             break
     else:
         lib["animes"].append(result)
@@ -586,7 +613,7 @@ def mode_scrap(api_key: str, user_id: str, name: str):
 
 def mode_farm(api_key: str, user_id: str, count: int = 5):
     lib = load_library()
-    known = {a["id"] for a in lib["animes"]}
+    known = {_clean_id(a["id"]) for a in lib["animes"]}
     available = [s for s in get_all_series(user_id, api_key)
                  if s["id"] not in known and not is_nsfw(s["metadata"])]
     if not available:
@@ -613,7 +640,7 @@ def mode_fix_names(api_key: str):
 
 def mode_import_jsons(api_key: str):
     lib = load_library()
-    existing_ids = {a["id"] for a in lib["animes"]}
+    existing_ids = {_clean_id(a["id"]) for a in lib["animes"]}
     files = sorted(glob.glob("./imports/*.json"))
     merged = 0
     for fpath in files:
@@ -623,11 +650,22 @@ def mode_import_jsons(api_key: str):
         except (OSError, json.JSONDecodeError) as e:
             print(f"[WARN] Ignorando {fpath}: {e}")
             continue
-        for anime in chunk.get("animes", []):
-            if anime["id"] not in existing_ids:
-                lib["animes"].append(anime)
-                existing_ids.add(anime["id"])
-                merged += 1
+        if not isinstance(chunk, dict):
+            print(f"[WARN] Ignorando {fpath}: raiz do JSON não é um objeto com a chave 'animes'.")
+            continue
+        for anime in chunk.get("animes") or []:
+            if not isinstance(anime, dict) or not anime.get("id"):
+                print(f"[WARN] Anime sem 'id' (ou formato inválido) em {fpath}. Pulando.")
+                continue
+            aid = _clean_id(anime["id"])
+            if aid in existing_ids:
+                continue
+            if is_nsfw({"Name": anime.get("name")}):
+                print(f"[SKIP] Conteúdo NSFW filtrado na importação: {anime.get('name')}")
+                continue
+            lib["animes"].append(anime)
+            existing_ids.add(aid)
+            merged += 1
     save_library(lib)
     print(f"[IMPORT] {merged} animes fundidos.")
 
@@ -641,7 +679,7 @@ def main():
     parser.add_argument("--anime", help="Nome exato ou parcial para modo scrap")
     parser.add_argument("--farm-count", type=int, default=5, help="Quantidade para modo farm")
     parser.add_argument("--limit", type=int, default=0, help="Limite de itens para modo all")
-    parser.add_argument("--api-key", help="API key do Jellyfin (padrão: env ANISTREAM_API_KEY)")
+    parser.add_argument("--api-key", help="API key do Jellyfin (padrão: env ANISTREAM_API_KEY; prefira a variável de ambiente)")
     parser.add_argument("--user-id", help="User ID do Jellyfin (padrão: env ANISTREAM_USER_ID)")
     args = parser.parse_args()
 
@@ -651,13 +689,18 @@ def main():
     # Argumento de linha de comando tem prioridade; senão usa a variável de ambiente.
     api_key = args.api_key or os.environ.get("ANISTREAM_API_KEY", "")
     user_id = args.user_id or os.environ.get("ANISTREAM_USER_ID", "")
-    if not api_key:
+
+    # Cada modo exige apenas as credenciais que realmente usa.
+    needs_key = args.mode not in ("import-jsons", "fix-names")
+    needs_user = args.mode in ("all", "scrap", "farm", "patch-logos")
+    if needs_key and not api_key:
         print("[FATAL] API key ausente: use --api-key ou defina ANISTREAM_API_KEY.")
         sys.exit(1)
-    if not user_id:
+    if needs_user and not user_id:
         print("[FATAL] User ID ausente: use --user-id ou defina ANISTREAM_USER_ID.")
         sys.exit(1)
-    os.environ["ANISTREAM_API_KEY"] = api_key  # mantém compatibilidade com os helpers de API
+    if api_key:
+        os.environ["ANISTREAM_API_KEY"] = api_key  # mantém compatibilidade com os helpers de API
 
     if args.mode in ("all", "scrap", "farm") and not any(
             FILTERS[k] for k in ("genres", "tags", "keywords", "title_blocks")):
@@ -678,7 +721,7 @@ def main():
         routes[args.mode]()
     except KeyboardInterrupt:
         print("\n[INTERRUPT] Operação abortada pelo usuário.")
-        sys.exit(0)
+        sys.exit(130)
     except Exception as e:
         print(f"\n[FATAL] Erro inesperado: {e}")
         import traceback; traceback.print_exc()
