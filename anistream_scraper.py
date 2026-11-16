@@ -334,7 +334,7 @@ def _image_url(serie: Dict, kind: str, size_qs: str) -> str:
     tag = (meta.get("ImageTags") or {}).get(kind)
     if not tag:
         return ""
-    item_id = serie.get("id") or meta.get("Id")
+    item_id = (serie.get("id") or meta.get("Id") or "").removeprefix("id-")
     return f"{BASE_URL}/Items/{item_id}/Images/{kind}?tag={tag}&{size_qs}"
 
 
@@ -343,6 +343,7 @@ def logo_url(serie: Dict) -> str:
     O servidor retorna 404 silencioso se a logo não existir — o frontend trata com onerror."""
     meta = serie.get("metadata", serie)
     item_id = serie.get("id") or meta.get("Id") or ""
+    item_id = item_id.removeprefix("id-")  # remove prefixo legado do scraper antigo
     if not item_id:
         return ""
     # usa tag se disponível (cache-busting), senão manda sem — funciona do mesmo jeito
@@ -355,8 +356,14 @@ def poster_url(serie: Dict) -> str:
     return _image_url(serie, "Primary", "fillWidth=400&quality=85")
 
 
+def _clean_id(raw_id: str) -> str:
+    """Remove prefixo 'id-' legado que o scraper antigo adicionava aos IDs do Jellyfin."""
+    return raw_id.removeprefix("id-") if raw_id else raw_id
+
+
 def _resolve_episode(ep_id: str, api_key: str) -> Optional[Dict]:
     """Detecta streams PT, consulta PlaybackInfo e monta {"url", "sub"}. None se falhar."""
+    ep_id = _clean_id(ep_id)
     streams = _detect_pt_streams(ep_id, api_key)
     if streams is None:
         return None
@@ -517,7 +524,7 @@ def mode_patch_logos(api_key: str, user_id: str):
     for anime in lib["animes"]:
         if all(anime.get(campo) for campo, _ in campos):
             continue
-        serie = by_id.get(anime["id"])
+        serie = by_id.get(_clean_id(anime["id"]))
         if serie is None:
             candidatos = by_name.get(_norm(anime.get("name")), [])
             serie = candidatos[0] if len(candidatos) == 1 else None
