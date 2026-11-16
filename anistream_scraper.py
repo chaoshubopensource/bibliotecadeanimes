@@ -38,6 +38,9 @@ STREAM_BASE = {"AudioCodec": "copy"}
 # Idiomas aceitos como português. O Jellyfin costuma usar ISO 639-2 ("por"), não "pt".
 PT_LANGS = {"pt", "por", "pt-br", "ptbr", "pob"}
 
+# Limite de falhas seguidas no update-library antes de abortar (evita gastar a execução inteira).
+MAX_FALHAS_SEGUIDAS = 50
+
 # 🔒 SEGURANÇA: Valores base64 devem permanecer codificados no source.
 # Decodificados apenas em memória durante a execução.
 NSFW_GENRES_B64 = os.getenv("NSFW_GENRES_B64", "")
@@ -484,6 +487,7 @@ def mode_update_library(api_key: str):
     lib = load_library()
     total = len(lib["animes"])
     eps_ok = eps_fail = 0
+    falhas_seguidas = 0
 
     try:
         for n, anime in enumerate(lib["animes"], 1):
@@ -491,7 +495,15 @@ def mode_update_library(api_key: str):
                 resolved = _resolve_episode(ep["id"], api_key)
                 if not resolved:
                     eps_fail += 1
+                    falhas_seguidas += 1
+                    if falhas_seguidas >= MAX_FALHAS_SEGUIDAS:
+                        raise RuntimeError(
+                            f"{falhas_seguidas} falhas seguidas (401/403 ou bloqueio). "
+                            "Abortando para não gastar a execução inteira. Verifique ANISTREAM_API_KEY, "
+                            "permissões do usuário no Jellyfin e bloqueio por IP/WAF."
+                        )
                     continue
+                falhas_seguidas = 0
                 ep["url"] = resolved["url"]
                 if resolved["sub"]:
                     ep["sub"] = resolved["sub"]
