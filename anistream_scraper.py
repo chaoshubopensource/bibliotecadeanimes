@@ -1,980 +1,617 @@
 #!/usr/bin/env python3
-# anistream_scraper.py  —  AniStream → AniLib  (versão otimizada)
-# Requisito: pip install requests
+"""
+anistream_scraper.py
+Extrai links HLS e metadados de uma instância Jellyfin (AniStream) e gera biblioteca_completa.json.
+Modos: all | update-library | patch-logos | scrap | farm | fix-names | import-jsons
+"""
 
-import requests, json, argparse, sys, secrets, re, glob, os, random, threading
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import argparse
+import base64
+import glob
+import hashlib
+import json
+import os
+import random
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
-BASE            = "https://app.anistream.biz"
-KNOWN_DEVICE_ID = "a9d0ebde-e77e-48d6-a6ee-cbfa9c991c1f"
-# AudioStreamIndex é definido dinamicamente por get_playback_info()
-# VideoBitrate baixado para 8 Mbps — força transcode pelo Jellyfin (resolve áudio AC3→AAC na maioria dos casos)
-STREAM_BASE     = (
-    "VideoCodec=hevc,h264&AudioCodec=copy"
-    "&VideoBitrate=19469898&AudioBitrate=192000&AudioSampleRate=48000"
-    "&MaxFramerate=23.976025&SegmentContainer=ts&MinSegments=2"
-    "&TranscodingMaxAudioChannels=6&RequireAvc=false"
-    "&EnableAudioVbrEncoding=true&VideoStreamIndex=0"
-)
-LIBRARY_FILE = "biblioteca_completa.json"
-SAVE_EVERY   = 10   # salva a cada N animes (menos I/O)
+import requests
 
-import base64 as _b64, time
-def _d(s): return _b64.b64decode(s).decode()
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIGURAÇÕES & CONSTANTES
+# ──────────────────────────────────────────────────────────────────────────────
+BASE_URL = "https://app.anistream.biz"
+LIBRARY_PATH = "biblioteca_completa.json"
+REQUEST_TIMEOUT = 15  # segundos
+PAGE_SIZE = 500       # itens por página nas listagens do Jellyfin
 
-# ── filtros NSFW ──────────────────────────────────────────────────────────────
+# Gera DeviceId persistente para evitar bloqueios por mudança frequente
+DEVICE_ID = hashlib.sha256("AniLibScraper-v1".encode()).hexdigest()[:32]
 
-NSFW_GENRES = {_d(x) for x in [
-    "aGVudGFp","YWR1bHQgYW5pbWF0aW9u","YWR1bHRzIG9ubHk=","eHh4",
-    "ZXJvZ2U=","YWR1bHQ=","cG9ybm9ncmFwaHk=","ZXhwbGljaXQ=","ZXJvdGlj"
-]}
+# Parâmetros fixos da URL HLS (main.m3u8).
+# AudioCodec=copy: browsers não decodificam AC3/EAC3 via MSE; o frontend converte
+# copy→aac em fixUrl() e o Jellyfin transcodifica quando o perfil do device pede AAC.
+STREAM_BASE = {"AudioCodec": "copy"}
 
-# "sex"/"yuri"/"yaoi" removidos — genéricos demais, causam falsos positivos
-NSFW_TAGS = {_d(x) for x in [
-    "aGVudGFp","ZXhwbGljaXQgY29udGVudA==","YWR1bHRzIG9ubHk=","bnNmdw==",
-    "bnVkaXR5","c2V4dWFsIGNvbnRlbnQ=","cG9ybm9ncmFwaGlj","ZXJvdGlj",
-    "aW5jZXN0","ZnV0YW5hcmk=","YWhlZ2Fv","Y3JlYW1waWU=","dmFnaW5hbA==",
-    "YW5hbA==","b3Jnb3Vzbw==","aGFyZGNvcmU=","dGVudGFjbGU=",
-    "dW5jZW5zb3JlZA==","bG9saQ==","c2hvdGE=","YmxhY2ttYWls",
-    "dmFnaW5h","cGVuaXM=","Y3Vt"
-]}
+# Idiomas aceitos como português. O Jellyfin costuma usar ISO 639-2 ("por"), não "pt".
+PT_LANGS = {"pt", "por", "pt-br", "ptbr", "pob"}
 
-NSFW_KEYWORDS = {_d(x) for x in [
-    "aGVudGFp","ZXJvdGlj","eHh4","dW5jZW5zb3JlZA==","YWhlZ2Fv",
-    "Y3JlYW1waWU=","ZnV0YW5hcmk=","aGFyZGNvcmU=","dGVudGFjbGU="
-]}
-
-NSFW_TITLE_BLOCKS = {_d(x) for x in [
-    "SGlnaCBTY2hvb2wgRHhE","SW50ZXJzcGVjaWVzIFJldmlld2Vycw==",
-    "WW9zdWdhIG5vIFNvcmE=","S2lzcyB4IFNpcw==","TWFrZW4tS2k=",
-    "U2hpbW9uZXRh","VmFsa3lyaWUgRHJpdmU=","UHJpc29uIFNjaG9vbA==",
-    "SWtraSBUb3VzZW4=","U2Vpa29uIG5vIFF3YXNlcg==","UXVlZW4ncyBCbGFkZQ==",
-    "TGFkaWVzIHZlcnN1cyBCdXRsZXJz","U29mdGVubmk=","Um8tS3l1LUJ1",
-    "RXJvbWFuZ2E=","TmFuZGUgS29rbyBuaSBTZW5zZWk=","U2tpcnQgbm8gTmFrYQ==",
-    "T3ZlcmZsb3c=","RG9tZXN0aWMgbmEgS2FuZWpv","UmVkbyBvZiBIZWFsZXI=",
-]}
-
-NSFW_WHITELIST_SUBS = [_d(x) for x in [
-    "TXVzaG9rdSBUZW5zZWk=",           # Mushoku Tensei
-    "R29ibGluIFNsYXllcg==",           # Goblin Slayer
-    "Q2hhcmxvdHRl",                   # Charlotte
-    "R3JlYXQgUHJldGVuZGVy",          # Great Pretender
-    "Tm9yYWdhbWk=",                   # Noragami
-    "TWFkZSBpbiBBYnlzcw==",           # Made in Abyss (séries e filmes)
-    "VGhlIFByb21pc2VkIE5ldmVybGFuZA==", # The Promised Neverland
-    "TXkgRHJlc3MtVXAgRGFybGluZw==",  # My Dress-Up Darling
-    "S29yZSB3YSBab21iaWU=",           # Kore wa Zombie Desu ka?
-    "S29pIHRvIFNlbmt5bw==",           # Koi to Senkyo to Chocolate
-    "SGVsbCBNb2Rl",                   # Hell Mode (título usa "hardcore" como dificuldade de jogo)
-]]
-
-def _title_blocked(name):
-    nl = name.lower()
-    return any(b.lower() in nl for b in NSFW_TITLE_BLOCKS)
-
-def _whitelisted(name):
-    nl = name.lower()
-    return any(w.lower() in nl for w in NSFW_WHITELIST_SUBS)
-
-def is_nsfw(serie):
-    name = serie.get("Name", "")
-    if _whitelisted(name): return False
-    genres = {g.lower() for g in serie.get("Genres", [])}
-    tags   = {t.lower() for t in serie.get("Tags", [])}
-    rating = (serie.get("OfficialRating") or "").upper()
-    if genres & NSFW_GENRES:                              return True
-    if tags   & NSFW_TAGS:                               return True
-    if rating in ("X", "NC-17", "AO", "XXX"):            return True
-    if any(kw in name.lower() for kw in NSFW_KEYWORDS):  return True
-    if _title_blocked(name):                              return True
-    return False
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-def new_uid():
-    return "id-" + format(random.getrandbits(32), '08x') + format(int(secrets.randbits(16)), '04x')
-
-def dash(s):
-    s = s.replace("-", "")
-    if len(s) != 32: return s
-    return f"{s[:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:]}"
-
-def item_id_from_url(url):
-    m = re.search(r'/videos/([0-9a-f-]{32,36})/', url, re.I)
-    return m.group(1).replace("-", "") if m else None
-
-# ── biblioteca ────────────────────────────────────────────────────────────────
-
-_save_lock   = threading.Lock()
-_pending_buf = []    # animes aguardando save (acesso sempre dentro do lock)
-_total_saved = 0     # contador thread-safe de animes na biblioteca + buffer
-
-def load_library():
-    if os.path.exists(LIBRARY_FILE):
-        try:
-            with open(LIBRARY_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            if "animes" in data: return data
-        except Exception:
-            pass
-    return {"app":"AniLib","author":"Heitor","license":"Open Source",
-            "exportedAt":"","version":1,"animes":[]}
-
-def save_library(lib, force=False):
-    """Thread-safe. Salva a cada SAVE_EVERY ou quando force=True."""
-    global _pending_buf, _total_saved
-    with _save_lock:
-        if not force and len(_pending_buf) < SAVE_EVERY:
-            return
-        lib["animes"].extend(_pending_buf)
-        _pending_buf = []
-        lib["exportedAt"] = datetime.now(timezone.utc).isoformat()
-        lib["animes"].sort(key=lambda a: a.get("name","").lower())
-        tmp = LIBRARY_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(lib, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, LIBRARY_FILE)
-        _total_saved = len(lib["animes"])
-
-def queue_anime(lib, anime):
-    """Enfileira anime e salva quando buffer cheio. Retorna contagem atual."""
-    global _pending_buf, _total_saved
-    with _save_lock:
-        _pending_buf.append(anime)
-        _total_saved += 1
-        count = _total_saved
-        should_save = len(_pending_buf) >= SAVE_EVERY
-    if should_save:
-        save_library(lib)
-    return count
-
-def flush_library(lib):
-    save_library(lib, force=True)
-
-def library_names(lib):
-    global _total_saved
-    _total_saved = len(lib["animes"])
-    return {a["name"].lower() for a in lib["animes"]}
-
-# ── API ───────────────────────────────────────────────────────────────────────
-
-def make_session(key):
-    """Sessão com connection pool e retry no transporte."""
-    s = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=0.5,          # 0.5 → 1 → 2 s entre tentativas
-        status_forcelist=[500,502,503,504],
-        allowed_methods=["GET","POST"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=30,
-        pool_maxsize=30,
-        pool_block=False,
-    )
-    s.mount("https://", adapter)
-    s.mount("http://",  adapter)
-    s.headers.update({
-        "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36",
-        "Authorization": (
-            f'MediaBrowser Token="{key}", Client="Jellyfin Web", '
-            f'Device="Chrome", DeviceId="{KNOWN_DEVICE_ID}", Version="10.9.11"'
-        ),
-        "Accept": "application/json",
-        "Connection": "keep-alive",
-    })
-    return s
-
-def api_get(session, path, _retries=3, **params):
-    """GET com jitter para evitar thundering herd quando vários workers falham juntos."""
-    last_exc = None
-    for attempt in range(_retries):
-        try:
-            r = session.get(BASE + path, params=params, timeout=(8, 40))
-            # (8s connect, 40s read)
-            r.raise_for_status()
-            return r.json()
-        except (requests.exceptions.Timeout,
-                requests.exceptions.ConnectionError) as e:
-            last_exc = e
-            time.sleep(0.5 + random.random())  # jitter 0.5–1.5 s
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code >= 500:
-                last_exc = e
-                time.sleep(0.5 + random.random())
-            else:
-                raise
-    raise last_exc
-
-def get_user_id(session):
-    for path in ("/Users/Me", "/Users", "/Sessions"):
-        try:
-            data = api_get(session, path)
-            if isinstance(data, dict) and data.get("Id"): return data["Id"]
-            if isinstance(data, list):
-                for item in data:
-                    uid = item.get("Id") or item.get("UserId")
-                    if uid: return uid
-        except Exception:
-            pass
-    return None
-
-def get_all_series(session, user_id):
-    all_items, start, batch = [], 0, 500
-    print("  puxando catálogo...", end="", flush=True)
-    while True:
-        data = api_get(session, f"/Users/{user_id}/Items",
-                       IncludeItemTypes="Series,Movie",
-                       Recursive="true",
-                       Fields="Genres,Tags,OfficialRating,ProductionYear,Overview,ImageTags",
-                       SortBy="SortName",
-                       SortOrder="Ascending",
-                       Limit=batch,
-                       StartIndex=start)
-        items = data.get("Items", [])
-        total = data.get("TotalRecordCount", 0)
-        all_items.extend(items)
-        start += batch
-        print(f" {len(all_items)}/{total}", end="", flush=True)
-        if start >= total or not items: break
-    print()
-    return all_items
-
-MAX_EPS = 2000   # nenhum anime real tem mais que isso; acima = dado corrompido no Jellyfin
-
-def logo_url(serie):
-    """Monta a URL da logo do anime se disponível, senão retorna ''."""
-    tag = (serie.get("ImageTags") or {}).get("Logo")
-    if not tag:
-        return ""
-    return f"{BASE}/Items/{serie['Id']}/Images/Logo?tag={tag}&fillWidth=1344&fillHeight=256&quality=75"
+# 🔒 SEGURANÇA: Valores base64 devem permanecer codificados no source.
+# Decodificados apenas em memória durante a execução.
+NSFW_GENRES_B64 = os.getenv("NSFW_GENRES_B64", "")
+NSFW_TAGS_B64 = os.getenv("NSFW_TAGS_B64", "")
+NSFW_KEYWORDS_B64 = os.getenv("NSFW_KEYWORDS_B64", "")
+NSFW_TITLE_BLOCKS_B64 = os.getenv("NSFW_TITLE_BLOCKS_B64", "")
+NSFW_WHITELIST_SUBS_B64 = os.getenv("NSFW_WHITELIST_SUBS_B64", "")
 
 
-def get_episodes(session, user_id, series_id):
-    all_eps, start, batch = [], 0, 1000
-    while True:
-        data = api_get(session, f"/Users/{user_id}/Items",
-                       ParentId=series_id,
-                       IncludeItemTypes="Episode",
-                       Recursive="true",
-                       Fields="Id,ParentIndexNumber,IndexNumber,Name",
-                       SortBy="ParentIndexNumber,IndexNumber",
-                       SortOrder="Ascending",
-                       Limit=batch,
-                       StartIndex=start)
-        items = data.get("Items", [])
-        total = data.get("TotalRecordCount", 0)
-        # dado claramente corrompido — aborta
-        if total > MAX_EPS:
-            print(f"    ⚠ {total} eps detectados — parece dado corrompido, pulando série", flush=True)
-            return []
-        all_eps.extend(items)
-        start += batch
-        if start >= total or not items: break
-        print(f"    … {len(all_eps)}/{total} eps", flush=True)
-    return all_eps
+def _b64_to_list(raw: str) -> List[str]:
+    """Decodifica string base64 em lista lowercase, ignora falhas e linhas em branco.
 
-def _best_audio_index(streams):
-    """Retorna o índice do áudio PT-BR ou None se não existir.
-
-    Detecta PT pelo campo Language (ISO 639) ou Title/DisplayTitle.
-    NÃO faz fallback para japonês — retorna None se PT ausente.
+    Linhas em branco precisam ser descartadas: "" in texto é sempre True, então um
+    item vazio faria tudo ser bloqueado (keywords) ou liberado (whitelist).
     """
-    audio = [s for s in streams if s.get("Type") == "Audio"]
-    if not audio:
-        return None
-
-    PT_LANGS  = {"por", "pt", "ptbr", "portuguese", "port", "pb", "pt-br", "pt_br"}
-    PT_WORDS  = ("portugu", "brasil", "pt-br", "ptbr")
-
-    def is_pt(s):
-        lang = (s.get("Language") or "").lower().replace("-", "").replace("_", "")
-        if lang in PT_LANGS:
-            return True
-        for field in ("Title", "DisplayTitle", "Label"):
-            t = (s.get(field) or "").lower()
-            if any(w in t for w in PT_WORDS):
-                return True
-        return False
-
-    # 1 — default PT
-    for s in audio:
-        if s.get("IsDefault") and is_pt(s):
-            return s["Index"]
-    # 2 — qualquer PT
-    for s in audio:
-        if is_pt(s):
-            return s["Index"]
-    # sem PT → retorna None (japonês é o fallback do caller)
-    return None
+    if not raw: return []
+    try:
+        linhas = base64.b64decode(raw).decode("utf-8").splitlines()
+        return [p for p in (l.lower().strip() for l in linhas) if p]
+    except Exception:
+        return []
 
 
-_DEVICE_PROFILE = {
-    "DirectPlayProfiles": [],
-    "TranscodingProfiles": [{
-        "Container": "ts", "Type": "Video",
-        "AudioCodec": "aac", "VideoCodec": "h264",
-        "Context": "Streaming", "Protocol": "hls",
-    }],
-    "CodecProfiles": [], "SubtitleProfiles": [],
+FILTERS = {
+    "genres": _b64_to_list(NSFW_GENRES_B64),
+    "tags": _b64_to_list(NSFW_TAGS_B64),
+    "keywords": _b64_to_list(NSFW_KEYWORDS_B64),
+    "title_blocks": _b64_to_list(NSFW_TITLE_BLOCKS_B64),
+    "whitelist_subs": _b64_to_list(NSFW_WHITELIST_SUBS_B64),
 }
 
 
-def _playback_info_post(session, user_id, iid, audio_idx=None):
-    """POST /PlaybackInfo — retorna (msid, tag, streams) ou (None, None, None) em erro."""
-    body = {"DeviceProfile": _DEVICE_PROFILE}
-    if audio_idx is not None:
-        body["AudioStreamIndex"] = audio_idx
+def _headers(api_key: str) -> Dict[str, str]:
+    return {"X-Emby-Token": api_key}
+
+
+def _api_get(endpoint: str, params: Optional[Dict] = None, **kwargs) -> requests.Response:
+    url = f"{BASE_URL}{endpoint}"
+    if params:
+        url += f"?{urlencode(params)}"
+    return requests.get(url, headers=_headers(kwargs.pop("apikey", os.environ["ANISTREAM_API_KEY"])), timeout=REQUEST_TIMEOUT)
+
+
+def _api_post(endpoint: str, json_payload: Dict, **kwargs) -> requests.Response:
+    url = f"{BASE_URL}{endpoint}"
+    return requests.post(url, headers=_headers(kwargs.pop("apikey", os.environ["ANISTREAM_API_KEY"])), json=json_payload, timeout=REQUEST_TIMEOUT)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FUNÇÕES DE MÍNIMA UTILIDADE
+# ──────────────────────────────────────────────────────────────────────────────
+def load_library(path: str = LIBRARY_PATH) -> Dict:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"app": "AniLib", "animes": []}
+
+
+def save_library(lib: Dict, path: str = LIBRARY_PATH):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(lib, f, indent=2, ensure_ascii=False)
+
+
+def _exists_in_lib(anime_id: str, lib: Dict) -> bool:
+    return any(a["id"] == anime_id for a in lib["animes"])
+
+
+def _find_anime_by_id(anime_id: str, lib: Dict) -> Optional[Dict]:
+    return next((a for a in lib["animes"] if a["id"] == anime_id), None)
+
+
+def _norm(text: Optional[str]) -> str:
+    """Normaliza nome para comparação (case-insensitive, espaços colapsados)."""
+    return " ".join((text or "").casefold().split())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EXTRAÇÃO DE METADADOS E STREAMS
+# ──────────────────────────────────────────────────────────────────────────────
+def get_all_series(user_id: str, api_key: str) -> List[Dict]:
+    """Lista Series/Movies (paginado). Cada item: {"id", "name", "metadata": <item cru do Jellyfin>}."""
+    items: List[Dict] = []
+    start = 0
+    while True:
+        params = {
+            "IncludeItemTypes": "Series,Movie",
+            "Recursive": "true",
+            "Fields": "Genres,Tags,OfficialRating,ProductionYear,Overview,ImageTags",
+            "SortBy": "SortName",  # ordem estável, necessária para paginar sem duplicar
+            "StartIndex": start,
+            "Limit": PAGE_SIZE,
+        }
+        resp = _api_get(f"/Users/{user_id}/Items", params=params, apikey=api_key)
+        resp.raise_for_status()
+        data = resp.json()
+        page = data.get("Items", [])
+        items.extend(page)
+        start += len(page)
+        if len(page) < PAGE_SIZE or start >= data.get("TotalRecordCount", start):
+            break
+    return [{"id": i["Id"], "name": i.get("Name", ""), "metadata": i} for i in items]
+
+
+def _ep_sort_key(ep: Dict) -> Tuple[int, int]:
+    season = ep.get("ParentIndexNumber")
+    if season == 0:
+        season = 10 ** 6  # especiais por último, para não deslocar a numeração
+    elif season is None:
+        season = 1
+    return (season, ep.get("IndexNumber") or 0)
+
+
+def get_episodes(serie_id: str, user_id: str, api_key: str) -> List[Dict]:
+    """Lista os episódios de uma série (recursivo — filhos diretos de uma Series são Seasons)."""
+    episodes: List[Dict] = []
+    start = 0
+    while True:
+        params = {
+            "ParentId": serie_id,
+            "Recursive": "true",
+            "IncludeItemTypes": "Episode",
+            "SortBy": "ParentIndexNumber,IndexNumber,SortName",
+            "StartIndex": start,
+            "Limit": PAGE_SIZE,
+        }
+        resp = _api_get(f"/Users/{user_id}/Items", params=params, apikey=api_key)
+        resp.raise_for_status()
+        data = resp.json()
+        page = data.get("Items", [])
+        episodes.extend(page)
+        start += len(page)
+        if len(page) < PAGE_SIZE or start >= data.get("TotalRecordCount", start):
+            break
+    episodes.sort(key=_ep_sort_key)
+    return episodes
+
+
+def _is_pt(stream: Dict) -> bool:
+    lang = (stream.get("Language") or "").lower().replace("_", "-").strip()
+    if lang in PT_LANGS or lang.startswith("pt-"):
+        return True
+    if lang in ("", "und"):  # sem idioma marcado: tenta pelo título da faixa
+        title = f"{stream.get('Title') or ''} {stream.get('DisplayTitle') or ''}".lower()
+        return "portugu" in title or "pt-br" in title or "ptbr" in title
+    return False
+
+
+def _detect_pt_streams(item_id: str, api_key: str) -> Optional[Tuple[int, int]]:
+    """Retorna (audio_idx, sub_idx) — -1 quando a faixa não existe — ou None em caso de falha.
+    Printa erro explícito em caso de falha HTTP/autenticação/rede."""
     try:
-        r = session.post(
-            f"{BASE}/Items/{iid}/PlaybackInfo",
-            params={"UserId": user_id},
-            json=body,
-            timeout=(8, 20),
-        )
-        if r.ok:
-            sources = r.json().get("MediaSources", [])
-            if sources:
-                src = sources[0]
-                return src.get("Id", iid), src.get("ETag", ""), src.get("MediaStreams", [])
-        else:
-            print(f"      PlaybackInfo HTTP {r.status_code}", flush=True)
-    except Exception as e:
-        print(f"      PlaybackInfo erro: {e}", flush=True)
-    return None, None, None
-
-
-def _best_subtitle_index(streams):
-    """Retorna o índice da legenda PT ou None."""
-    subs = [s for s in streams if s.get("Type") == "Subtitle"]
-    if not subs:
+        resp = _api_get(f"/Items/{item_id}?Fields=MediaStreams", apikey=api_key)
+    except requests.RequestException as e:
+        print(f"[ERROR] Falha de rede ao buscar streams do item {item_id}: {e}")
         return None
-    PT_LANGS = {"por", "pt", "ptbr", "portuguese", "port", "pb", "pt-br", "pt_br"}
-    PT_WORDS = ("portugu", "brasil", "pt-br", "ptbr")
 
-    def is_pt(s):
-        lang = (s.get("Language") or "").lower().replace("-", "").replace("_", "")
-        if lang in PT_LANGS:
-            return True
-        for field in ("Title", "DisplayTitle", "Label"):
-            t = (s.get(field) or "").lower()
-            if any(w in t for w in PT_WORDS):
-                return True
+    if resp.status_code in (401, 403):
+        print(f"[ERROR] Credenciais inválidas ou permissão negada para /Items/{item_id}. Status: {resp.status_code}")
+        return None
+    elif resp.status_code != 200:
+        print(f"[ERROR] Falha ao buscar streams do item {item_id}. Status: {resp.status_code} - {resp.text[:200]}")
+        return None
+
+    try:
+        data = resp.json()
+        sources = data.get("MediaSources") or [{}]
+        streams = sources[0].get("MediaStreams") or data.get("MediaStreams") or []
+
+        pt_audio_idx = None
+        first_audio_idx = None
+        pt_sub_idx = None
+
+        for i, stream in enumerate(streams):
+            stype = (stream.get("Type") or "").lower()
+            # AudioStreamIndex/SubtitleStreamIndex do Jellyfin = campo "Index", não a posição na lista
+            idx = stream.get("Index", i)
+
+            if stype == "audio":
+                if first_audio_idx is None:
+                    first_audio_idx = idx
+                if pt_audio_idx is None and _is_pt(stream):
+                    pt_audio_idx = idx
+            elif stype == "subtitle":
+                # só legendas de texto (convertíveis p/ VTT) e não "forced"
+                if pt_sub_idx is None and _is_pt(stream) and not stream.get("IsForced") \
+                        and stream.get("IsTextSubtitleStream", True):
+                    pt_sub_idx = idx
+
+        if pt_audio_idx is None:
+            if first_audio_idx is None:
+                print(f"[WARN] Nenhuma faixa de áudio encontrada para {item_id}.")
+            else:
+                print(f"[WARN] Nenhum áudio PT-BR detectado para {item_id}. Usando primeiro áudio disponível.")
+                pt_audio_idx = first_audio_idx
+
+        return (pt_audio_idx if pt_audio_idx is not None else -1, pt_sub_idx if pt_sub_idx is not None else -1)
+
+    except Exception as e:
+        print(f"[ERROR] Falha interna ao interpretar MediaStreams de {item_id}: {e}")
+        return None
+
+
+def _playback_info_post(item_id: str, api_key: str, audio_stream_index: int) -> Optional[Dict]:
+    payload = {
+        "DeviceProfile": {
+            "Name": "AniLib Web Client",
+            "MaxStreamingBitrate": 120000000,
+            "TranscodingProtocols": ["hls"],
+            "DirectPlayProfiles": [{"Container": "ts,mpegts,m3u8,aac", "AudioCodec": "aac"}]
+        },
+        "AudioStreamIndex": audio_stream_index,
+        "SubtitleStreamIndex": -1,
+        "OpenSubtitlesFormat": 0,
+        "IsPlayback": True
+    }
+    resp = _api_post(f"/Items/{item_id}/PlaybackInfo", json_payload=payload, apikey=api_key)
+    resp.raise_for_status()
+    data = resp.json()
+
+    media_sources = data.get("MediaSources", [])
+    if not media_sources:
+        print(f"[WARN] PlaybackInfo retornou vazio para {item_id}")
+        return None
+
+    source = media_sources[0]
+    return {
+        "media_source_id": source.get("Id", ""),
+        "etag": source.get("Etag", ""),
+        "streams": source.get("MediaStreams", [])
+    }
+
+
+def build_hls_url(item_id: str, playback: Dict, api_key: str, audio_idx: int) -> str:
+    params = {
+        **STREAM_BASE,
+        "DeviceId": DEVICE_ID,
+        "MediaSourceId": playback["media_source_id"],
+        "AudioStreamIndex": audio_idx,
+        "PlaySessionId": hashlib.md5(time.time().__repr__().encode()).hexdigest()[:16],
+        "ApiKey": api_key,
+    }
+    return f"{BASE_URL}/videos/{item_id}/main.m3u8?{urlencode(params)}"
+
+
+def build_sub_url(item_id: str, media_source_id: str, sub_idx: int, api_key: str) -> str:
+    return f"{BASE_URL}/Videos/{item_id}/{media_source_id}/Subtitles/{sub_idx}/0/Stream.vtt?{urlencode({'ApiKey': api_key})}"
+
+
+def _image_url(serie: Dict, kind: str, size_qs: str) -> str:
+    """Monta URL de imagem a partir de ImageTags. Aceita o item cru do Jellyfin
+    ou o wrapper {"id", "name", "metadata"} retornado por get_all_series."""
+    meta = serie.get("metadata", serie)
+    tag = (meta.get("ImageTags") or {}).get(kind)
+    if not tag:
+        return ""
+    item_id = serie.get("id") or meta.get("Id")
+    return f"{BASE_URL}/Items/{item_id}/Images/{kind}?tag={tag}&{size_qs}"
+
+
+def logo_url(serie: Dict) -> str:
+    return _image_url(serie, "Logo", "fillWidth=1344&fillHeight=256&quality=75")
+
+
+def poster_url(serie: Dict) -> str:
+    return _image_url(serie, "Primary", "fillWidth=400&quality=85")
+
+
+def _resolve_episode(ep_id: str, api_key: str) -> Optional[Dict]:
+    """Detecta streams PT, consulta PlaybackInfo e monta {"url", "sub"}. None se falhar."""
+    streams = _detect_pt_streams(ep_id, api_key)
+    if streams is None:
+        return None
+    audio_idx, sub_idx = streams
+    if audio_idx < 0:
+        print(f"[WARN] Sem faixa de áudio utilizável em {ep_id}. Pulando.")
+        return None
+
+    try:
+        playback = _playback_info_post(ep_id, api_key, audio_idx)
+    except requests.RequestException as e:
+        print(f"[ERROR] PlaybackInfo falhou para {ep_id}: {e}")
+        return None
+    if not playback:
+        return None
+
+    sub = build_sub_url(ep_id, playback["media_source_id"], sub_idx, api_key) if sub_idx >= 0 else ""
+    return {"url": build_hls_url(ep_id, playback, api_key, audio_idx), "sub": sub}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FILTROS & VALIDAÇÃO
+# ──────────────────────────────────────────────────────────────────────────────
+def is_nsfw(serie_meta: Dict) -> bool:
+    name_lower = serie_meta.get("Name", "").lower()
+    genres = [g.lower() for g in serie_meta.get("Genres", [])]
+    tags = [t.lower() for t in serie_meta.get("Tags", [])]
+
+    # Whitelist verifica legendas
+    whitelist_subs = FILTERS.get("whitelist_subs", [])
+    # Se tiver legenda na whitelist, ignora filtro
+    if whitelist_subs and any(s in name_lower for s in whitelist_subs):
         return False
 
-    for s in subs:
-        if s.get("IsDefault") and is_pt(s):
-            return s["Index"]
-    for s in subs:
-        if is_pt(s):
-            return s["Index"]
-    return None
+    # Verifica gêneros/tags
+    if any(g in genres for g in FILTERS["genres"]): return True
+    if any(t in tags for t in FILTERS["tags"]): return True
+    if any(k in name_lower for k in FILTERS["keywords"]): return True
+    if any(block in name_lower for block in FILTERS["title_blocks"]): return True
+
+    return False
 
 
-def _detect_pt_streams(session, item_id):
-    """GET /Items/{id}?Fields=MediaStreams — retorna (audio_idx, sub_idx), ambos podem ser None."""
-    iid = dash(item_id)
-    try:
-        r = session.get(
-            f"{BASE}/Items/{iid}",
-            params={"Fields": "MediaStreams"},
-            timeout=(5, 15),
-        )
-        if r.status_code in (401, 403):
-            print(f"  ✗ CREDENCIAIS INVÁLIDAS ({r.status_code}) — verifique --api-key e --user-id", flush=True)
-            return None, None
-        if not r.ok:
-            print(f"  ⚠ detect {iid}: HTTP {r.status_code}", flush=True)
-            return None, None
-        data = r.json()
-        streams = data.get("MediaStreams") or []
-        if not streams:
-            for src in data.get("MediaSources", []):
-                streams = src.get("MediaStreams") or []
-                if streams:
-                    break
-        audio_idx = _best_audio_index(streams)
-        sub_idx   = _best_subtitle_index(streams)
-        if audio_idx is not None:
-            print(f"  🇧🇷 BR encontrado (áudio idx={audio_idx}"
-                  + (f", legenda idx={sub_idx}" if sub_idx is not None else "")
-                  + ")", flush=True)
-        return audio_idx, sub_idx
-    except Exception as e:
-        print(f"  ⚠ detect erro {iid}: {e}", flush=True)
-    return None, None
+# ──────────────────────────────────────────────────────────────────────────────
+# MODOS DE OPERAÇÃO
+# ──────────────────────────────────────────────────────────────────────────────
+def scrape_anime(serie_id: str, serie_data: Dict, api_key: str, user_id: str) -> Optional[Dict]:
+    meta = serie_data["metadata"]
+    nome = meta.get("Name", "Unknown")
 
+    if is_nsfw(meta):
+        print(f"[SKIP] Conteúdo NSFW filtrado: {nome}")
+        return None
 
-def _detect_pt_index(session, item_id):
-    """Compat — retorna só audio_idx."""
-    audio_idx, _ = _detect_pt_streams(session, item_id)
-    return audio_idx
-
-
-def get_playback_info(session, user_id, item_id):
-    """Retorna (media_source_id, tag, audio_stream_index).
-
-    Fluxo de dois passos para PT-BR:
-      1. GET /Items/{id}?Fields=MediaStreams  → detecta índice do áudio PT
-      2. Se PT encontrado → POST PlaybackInfo com AudioStreamIndex=PT no body
-         → Jellyfin devolve MediaSourceId gerado pra esse áudio (obrigatório)
-      Se PT não encontrado → POST PlaybackInfo sem preferência de áudio
-    """
-    iid    = dash(item_id)
-    pt_idx = _detect_pt_index(session, item_id)
-
-    # ── POST PlaybackInfo com AudioStreamIndex do PT (ou padrão) ──────────────
-    msid, tag, streams_pb = _playback_info_post(session, user_id, iid, audio_idx=pt_idx)
-
-    if msid:
-        aidx = pt_idx if pt_idx is not None else _best_audio_index(streams_pb or [])
-        return msid, tag, aidx
-
-    return item_id, "", pt_idx
-
-
-def build_url(item_id, media_source_id, key, play_session, tag="", audio_idx=None):
-    iid  = dash(item_id.replace("-", ""))
-    msid = media_source_id.replace("-", "")
-    # fallback: índice 1 se PlaybackInfo não retornou nada
-    aidx = audio_idx if audio_idx is not None else 1
-    url  = (
-        f"{BASE}/videos/{iid}/main.m3u8"
-        f"?DeviceId={KNOWN_DEVICE_ID}"
-        f"&MediaSourceId={msid}"
-        f"&{STREAM_BASE}"
-        f"&AudioStreamIndex={aidx}"
-        f"&PlaySessionId={play_session}"
-        f"&ApiKey={key}"
-    )
-    if tag: url += f"&Tag={tag}"
-    return url
-
-def scrape_serie(session, user_id, series_id, anime_name, key, no_tag=False):
-    episodes = get_episodes(session, user_id, series_id)
-    if not episodes: return []
-    ep_list = []
-    for ep in episodes:
-        item_id = ep["Id"]
-        season  = ep.get("ParentIndexNumber", 1)
-        num_i   = ep.get("IndexNumber")
-        num     = str(num_i) if num_i is not None else ep.get("Name", "?")
-        if season and season > 1:
-            num = f"S{season}E{num}"
-        play_session = secrets.token_hex(16)
-        if no_tag:
-            msid, tag, aidx = item_id.replace("-", ""), "", None
-        else:
-            msid, tag, aidx = get_playback_info(session, user_id, item_id)
-            msid = (msid or item_id).replace("-", "")
-        ep_list.append({"id": new_uid(), "num": num,
-                        "url": build_url(item_id, msid, key, play_session, tag, aidx)})
-    return ep_list
-
-def scrape_movie(session, user_id, item_id, key, no_tag=False):
-    """Filmes não têm episódios — usa o próprio item como única entrada."""
-    play_session = secrets.token_hex(16)
-    if no_tag:
-        msid, tag, aidx = item_id.replace("-", ""), "", None
+    # Movie é o próprio "episódio"; Series precisa listar os Episodes (recursivo).
+    if meta.get("Type") == "Movie":
+        episodes_raw = [meta]
     else:
-        msid, tag, aidx = get_playback_info(session, user_id, item_id)
-        msid = (msid or item_id).replace("-", "")
-    return [{"id": new_uid(), "num": "1",
-             "url": build_url(item_id, msid, key, play_session, tag, aidx)}]
-
-# ── worker pool com throttle adaptativo ──────────────────────────────────────
-
-class AdaptivePool:
-    """ThreadPoolExecutor com semáforo adaptativo.
-    Se a taxa de erro subir, reduz concorrência automaticamente.
-    Se estabilizar, volta a subir até o máximo.
-    """
-    def __init__(self, max_workers):
-        self.max_w    = max_workers
-        self._sem     = threading.Semaphore(max_workers)
-        self._lock    = threading.Lock()
-        self._errors  = 0
-        self._ok      = 0
-        self._cur_w   = max_workers
-
-    def acquire(self): self._sem.acquire()
-    def release(self): self._sem.release()
-
-    def report(self, success):
-        with self._lock:
-            if success:
-                self._ok += 1
-                # a cada 20 ok consecutivos, tenta aumentar 1 slot (até max)
-                if self._ok % 20 == 0 and self._cur_w < self.max_w:
-                    self._cur_w += 1
-                    self._sem.release()
-                self._errors = 0
-            else:
-                self._errors += 1
-                self._ok = 0
-                # a cada 3 erros seguidos, remove 1 slot (mínimo 2)
-                if self._errors % 3 == 0 and self._cur_w > 2:
-                    self._cur_w -= 1
-                    self._sem.acquire()   # remove permissão extra
-
-# ── modos ─────────────────────────────────────────────────────────────────────
-
-def _run_parallel(session, user_id, args, pendentes, lib, label="all"):
-    ok, fail, skip = 0, 0, 0
-    falhos = []
-    total  = len(pendentes)
-    pool   = AdaptivePool(args.workers)
-
-    # heartbeat
-    _done_ev = threading.Event()
-    def _hb():
-        while not _done_ev.wait(20):
-            with pool._lock:
-                cur = pool._cur_w
-            print(f"  … {ok+fail+skip}/{total} processados | workers ativos: {cur}", flush=True)
-    threading.Thread(target=_hb, daemon=True).start()
-
-    def _scrape_one(item):
-        idx, serie = item
-        name = serie["Name"]
-        pool.acquire()
         try:
-            if serie.get("Type") == "Movie":
-                ep_list = scrape_movie(session, user_id, serie["Id"], args.api_key, args.no_tag)
-            else:
-                ep_list = scrape_serie(session, user_id, serie["Id"], name, args.api_key, args.no_tag)
-            pool.report(True)
-            return idx, serie, ep_list, None
-        except Exception as e:
-            pool.report(False)
-            return idx, serie, [], str(e)
-        finally:
-            pool.release()
+            episodes_raw = get_episodes(serie_id, user_id, api_key)
+        except requests.RequestException as e:
+            print(f"[ERROR] Falha ao listar episódios de {nome}: {e}")
+            return None
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(_scrape_one, (i, s)): i
-                   for i, s in enumerate(pendentes, 1)}
-        for fut in as_completed(futures):
-            idx, serie, ep_list, err = fut.result()
-            name = serie["Name"]
-            year = f" ({serie['ProductionYear']})" if serie.get("ProductionYear") else ""
-            tag  = f"[{idx:>4}/{total}]"
-            if err:
-                print(f"  {tag} {name}{year}  — erro: {err[:70]}")
-                falhos.append(serie)
-                fail += 1
-            elif not ep_list:
-                print(f"  {tag} {name}{year}  — sem eps")
-                skip += 1
-            else:
-                anime = {"id": new_uid(), "name": name, "poster": "", "logo_url": logo_url(serie), "episodes": ep_list}
-                n_bib = queue_anime(lib, anime)
-                ok += 1
-                print(f"  {tag} {name}{year}  → {len(ep_list)} eps  (biblioteca: {n_bib})")
-
-    _done_ev.set()
-    flush_library(lib)   # salva o que ficou no buffer
-
-    # ── retry sequencial dos que falharam ────────────────────────────────────
-    if falhos:
-        print(f"\n  retentando {len(falhos)} que falharam…")
-        for serie in falhos:
-            name = serie["Name"]
-            year = f" ({serie['ProductionYear']})" if serie.get("ProductionYear") else ""
-            time.sleep(1 + random.random())
-            try:
-                if serie.get("Type") == "Movie":
-                    ep_list = scrape_movie(session, user_id, serie["Id"], args.api_key, args.no_tag)
-                else:
-                    ep_list = scrape_serie(session, user_id, serie["Id"], name, args.api_key, args.no_tag)
-                if ep_list:
-                    anime = {"id": new_uid(), "name": name, "poster": "", "logo_url": logo_url(serie), "episodes": ep_list}
-                    lib["animes"].append(anime)
-                    flush_library(lib)
-                    print(f"  ✓ {name}{year}  → {len(ep_list)} eps")
-                    ok += 1; fail -= 1
-                else:
-                    print(f"  sem eps: {name}{year}")
-            except Exception as e2:
-                print(f"  ✗ {name}{year}  — {str(e2)[:70]}")
-
-    total_eps = sum(len(a["episodes"]) for a in lib["animes"])
-    print(f"\n  concluído: {ok} ok  {skip} sem eps  {fail} erro")
-    print(f"  biblioteca: {len(lib['animes'])} animes / {total_eps} eps  →  {LIBRARY_FILE}")
-
-
-def mode_scrap(session, user_id, args):
-    print(f"  buscando: {args.anime}")
-    data = api_get(session, f"/Users/{user_id}/Items",
-                   searchTerm=args.anime,
-                   IncludeItemTypes="Series",
-                   Fields="Genres,Tags,OfficialRating,ProductionYear,ImageTags",
-                   Recursive="true", Limit=50)
-    results = data.get("Items", [])
-    if not results:
-        print("  nenhum resultado."); return
-
-    if len(results) > 1:
-        for i, r in enumerate(results):
-            year = f" ({r['ProductionYear']})" if r.get("ProductionYear") else ""
-            print(f"  [{i:>2}] {r['Name']}{year}  —  {r['Id']}")
-        idx = int(input(f"\n  escolha (0-{len(results)-1}): ").strip())
-        chosen = results[idx]
-    else:
-        chosen = results[0]
-
-    lib = load_library()
-    ep_list = scrape_serie(session, user_id, chosen["Id"], chosen["Name"], args.api_key, args.no_tag)
-    if not ep_list:
-        print("  sem episódios."); return
-    lib["animes"] = [a for a in lib["animes"] if a["name"].lower() != chosen["Name"].lower()]
-    lib["animes"].append({"id": new_uid(), "name": chosen["Name"], "poster": "", "logo_url": logo_url(chosen), "episodes": ep_list})
-    flush_library(lib)
-    total = sum(len(a["episodes"]) for a in lib["animes"])
-    print(f"  {chosen['Name']} → {len(ep_list)} eps  |  biblioteca: {len(lib['animes'])} animes / {total} eps")
-
-
-def mode_all(session, user_id, args):
-    all_series = get_all_series(session, user_id)
-    print(f"  {len(all_series)} séries no servidor")
-
-    clean, bloqueados = [], []
-    for s in all_series:
-        (bloqueados if is_nsfw(s) else clean).append(s)
-    print(f"  {len(bloqueados)} removidos (NSFW)  →  {len(clean)} para scrap")
-    if bloqueados:
-        print("  — removidos (NSFW) —")
-        for b in sorted(b["Name"] if isinstance(b, dict) else b for b in bloqueados):
-            print(f"    {b}")
-
-    lib       = load_library()
-    done      = library_names(lib)
-    pendentes = [s for s in clean if s["Name"].lower() not in done]
-    print(f"  {len(done)} já na biblioteca  →  {len(pendentes)} novos\n")
-    if not pendentes:
-        print("  biblioteca já está completa."); return
-
-    _run_parallel(session, user_id, args, pendentes, lib)
-
-
-def mode_farm(session, user_id, args):
-    all_series = get_all_series(session, user_id)
-    clean      = [s for s in all_series if not is_nsfw(s)]
-    lib        = load_library()
-    done       = library_names(lib)
-    novos      = [s for s in clean if s["Name"].lower() not in done]
-    if not novos:
-        print("  tudo já baixado."); return
-    pick = random.sample(novos, min(args.farm_count, len(novos)))
-    print(f"  sorteando {len(pick)} de {len(novos)} disponíveis\n")
-    _run_parallel(session, user_id, args, pick, lib, label="farm")
-
-
-def mode_update_library(session, user_id, args):
-    """Atualiza URLs da biblioteca em paralelo.
-
-    Fast-path por anime: detecta PT apenas no PRIMEIRO episódio (1 GET).
-      • PT encontrado → POST PlaybackInfo com AudioStreamIndex=PT em cada ep
-      • Só japonês    → monta URL direto (AudioStreamIndex=1) sem chamada extra
-    """
-    lib = load_library()
-    if not lib["animes"]:
-        print("  biblioteca vazia."); return
-    total_animes = len(lib["animes"])
-    print(f"  {total_animes} animes na biblioteca\n")
-
-    lock = threading.Lock()
-    ok = fail = 0
-
-    def _update_anime(item):
-        i, anime = item
-        name = anime["name"]
-        eps  = anime["episodes"]
-        tag_prefix = f"  [{i:>4}/{total_animes}] {name}"
-
-        ep_ids = [(ep, item_id_from_url(ep["url"])) for ep in eps]
-        ep_ids = [(ep, iid) for ep, iid in ep_ids if iid]
-
-        if not ep_ids:
-            print(f"{tag_prefix}  — sem eps", flush=True)
-            return False
-
-        # 1 GET para detectar PT no primeiro ep (áudio + legenda)
-        pt_audio, pt_sub = _detect_pt_streams(session, ep_ids[0][1])
-
-        parts = []
-        if pt_audio is not None:
-            parts.append(f"🇧🇷 áudio (idx={pt_audio})")
-        if pt_sub is not None:
-            parts.append(f"legenda (idx={pt_sub})")
-        label = "  ".join(parts) if parts else "🇯🇵 só japonês"
-
-        print(f"{tag_prefix}  {label}  ({len(ep_ids)} eps)", flush=True)
-
-        for ep, item_id in ep_ids:
-            play_session = secrets.token_hex(16)
-            iid          = dash(item_id)
-            if pt_audio is not None:
-                msid, tag, _ = _playback_info_post(session, user_id, iid, audio_idx=pt_audio)
-                msid = (msid or item_id).replace("-", "")
-                aidx = pt_audio
-            else:
-                msid = item_id.replace("-", "")
-                tag  = ""
-                aidx = 1
-            ep["url"] = build_url(item_id, msid, args.api_key, play_session, tag, aidx)
-            # legenda PT — armazena link VTT
-            if pt_sub is not None:
-                ep["sub"] = (
-                    f"{BASE}/Videos/{iid}/{msid}"
-                    f"/Subtitles/{pt_sub}/0/Stream.vtt"
-                    f"?ApiKey={args.api_key}"
-                )
-            else:
-                ep.pop("sub", None)
-
-        return True
-
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(_update_anime, (i, a)): a
-                   for i, a in enumerate(lib["animes"], 1)}
-        for fut in as_completed(futures):
-            with lock:
-                if fut.result():
-                    ok += 1
-                else:
-                    fail += 1
-
-    flush_library(lib)
-    print(f"\n  update: {ok} ok  {fail} sem eps  →  {LIBRARY_FILE}")
-
-
-def mode_patch_logos(session, user_id):
-    """Preenche logo_url nos animes da biblioteca que ainda não têm o campo."""
-    lib = load_library()
-    if not lib["animes"]:
-        print("  biblioteca vazia."); return
-
-    sem_logo = [a for a in lib["animes"] if not a.get("logo_url")]
-    print(f"  {len(lib['animes'])} animes na biblioteca  →  {len(sem_logo)} sem logo_url\n")
-    if not sem_logo:
-        print("  todos já têm logo_url."); return
-
-    # puxa catálogo completo com ImageTags (1 chamada paginada)
-    all_series = get_all_series(session, user_id)
-    # índice nome→item (lowercase)
-    idx = {s["Name"].lower(): s for s in all_series}
-
-    patched = 0
-    for anime in lib["animes"]:
-        if anime.get("logo_url"):
+    episodes = []
+    for i, ep in enumerate(episodes_raw):
+        resolved = _resolve_episode(ep["Id"], api_key)
+        if not resolved:
             continue
-        serie = idx.get(anime["name"].lower())
-        url   = logo_url(serie) if serie else ""
-        anime["logo_url"] = url
-        if url:
-            print(f"  ✓ {anime['name']}")
-            patched += 1
-        else:
-            anime["logo_url"] = ""   # garante que o campo existe mesmo vazio
+        episodes.append({
+            "id": ep["Id"],
+            "num": str(i + 1),
+            "url": resolved["url"],
+            "sub": resolved["sub"]
+        })
 
-    flush_library(lib)
-    print(f"\n  logos adicionadas: {patched}  →  {LIBRARY_FILE}")
+    if not episodes:
+        # não retorna anime vazio: assim ele não entra na biblioteca e é tentado de novo na próxima execução
+        print(f"[WARN] Nenhum episódio utilizável em {nome}. Não adicionado.")
+        return None
+
+    return {
+        "id": serie_id,
+        "name": nome,
+        "poster": poster_url(serie_data),
+        "logo_url": logo_url(serie_data),
+        "year": meta.get("ProductionYear", ""),
+        "overview": meta.get("Overview", ""),
+        "episodes": episodes
+    }
 
 
-def mode_fix_names():
+def mode_all(api_key: str, user_id: str, limit: int = 0):
+    print("[INFO] Iniciando modo ALL (incremental)...")
     lib = load_library()
-    if not lib["animes"]:
-        print("  biblioteca vazia."); return
-    ANILIST = "https://graphql.anilist.co"
-    QUERY   = "query($q:String){Page(perPage:5){media(search:$q,type:ANIME){title{romaji english}}}}"
-    fixed = skipped = 0
-    print(f"  corrigindo {len(lib['animes'])} nomes via AniList…\n")
-    for anime in lib["animes"]:
-        old = anime["name"]
-        try:
-            resp = requests.post(ANILIST,
-                json={"query": QUERY, "variables": {"q": old}},
-                headers={"Content-Type": "application/json"}, timeout=10)
-            resp.raise_for_status()
-            media = resp.json().get("data", {}).get("Page", {}).get("media", [])
-            if not media:
-                skipped += 1; continue
-            novo = media[0]["title"].get("english") or media[0]["title"].get("romaji") or old
-            if novo.lower() != old.lower():
-                print(f"  {old}  →  {novo}")
-                anime["name"] = novo; fixed += 1
-        except Exception as e:
-            print(f"  erro ({old}): {e}"); skipped += 1
-        time.sleep(0.5)
-    flush_library(lib)
-    print(f"\n  corrigidos: {fixed}  sem resultado: {skipped}")
+    known = {a["id"] for a in lib["animes"]}  # a biblioteca é a fonte da verdade (CI não persiste arquivos locais)
+    all_series = get_all_series(user_id, api_key)
 
-
-def mode_scrap_legacy_jsons():
-    files = [f for f in glob.glob("*.json") if f != LIBRARY_FILE]
-    if not files:
-        print("  nenhum JSON avulso."); return
-    lib = load_library(); done = library_names(lib); added = 0
-    for fname in sorted(files):
-        try:
-            with open(fname, encoding="utf-8") as f: data = json.load(f)
-        except Exception: continue
-        for anime in data.get("animes", []):
-            if anime["name"].lower() in done:
-                print(f"  duplicado: {anime['name']}"); continue
-            lib["animes"].append(anime); done.add(anime["name"].lower())
-            print(f"  + {anime['name']}  ({len(anime['episodes'])} eps)"); added += 1
-    flush_library(lib)
-    total = sum(len(a["episodes"]) for a in lib["animes"])
-    print(f"\n  importados: {added}  |  biblioteca: {len(lib['animes'])} animes / {total} eps")
-
-# ── GitHub sync ───────────────────────────────────────────────────────────────
-
-GITHUB_REPO   = "chaoshubopensource/bibliotecadeanimes"
-GITHUB_PATH   = "biblioteca_completa.json"
-GITHUB_BRANCH = "main"
-
-def pull_from_github():
-    """Baixa a biblioteca atual do GitHub antes de rodar (mantém estado incremental no Render)."""
-    url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_PATH}"
+    new_count = 0
     try:
-        r = requests.get(url, timeout=60)
-        if r.ok:
-            with open(LIBRARY_FILE, "wb") as f:
-                f.write(r.content)
-            kb = len(r.content) // 1024
-            print(f"  ✓ biblioteca baixada do GitHub ({kb} KB)")
-        else:
-            print(f"  ⚠ não consegui baixar do GitHub ({r.status_code}) — começa do zero")
-    except Exception as e:
-        print(f"  ⚠ erro ao baixar do GitHub: {e} — começa do zero")
+        for s in all_series:
+            if s["id"] in known: continue
+            if limit and new_count >= limit: break
+            result = scrape_anime(s["id"], s, api_key, user_id)
+            if result:
+                lib["animes"].append(result)
+                known.add(s["id"])
+                new_count += 1
+                print(f"[OK] Adicionado: {result['name']} ({len(result['episodes'])} eps)")
+                if new_count % 5 == 0: save_library(lib)  # checkpoint
+    finally:
+        save_library(lib)
+    print(f"[DONE] Novo(s) anime(s): {new_count}. Biblioteca salva.")
 
-def push_to_github(token: str):
-    """Faz upload do biblioteca_completa.json direto via GitHub API (sem git)."""
-    if not token:
-        print("  ⚠ GITHUB_TOKEN não definido — push ignorado.")
+
+def mode_update_library(api_key: str):
+    print("[INFO] Iniciando UPDATE-LIBRARY (renova URLs)...")
+    lib = load_library()
+    total = len(lib["animes"])
+    eps_ok = eps_fail = 0
+
+    try:
+        for n, anime in enumerate(lib["animes"], 1):
+            for ep in anime.get("episodes", []):
+                resolved = _resolve_episode(ep["id"], api_key)
+                if not resolved:
+                    eps_fail += 1
+                    continue
+                ep["url"] = resolved["url"]
+                if resolved["sub"]:
+                    ep["sub"] = resolved["sub"]
+                eps_ok += 1
+            if n % 10 == 0: print(f"[PROGRESS] {n}/{total}")
+    finally:
+        save_library(lib)
+    print(f"[DONE] {eps_ok} episódios renovados em {total} animes ({eps_fail} falhas).")
+
+
+def mode_patch_logos(api_key: str, user_id: str):
+    """Backfill sem re-scrap: preenche logo_url (e poster) vazios usando uma única chamada a
+    get_all_series. Match por id; se o id não existir no Jellyfin, tenta por nome (se único)."""
+    print("[INFO] Iniciando PATCH-LOGOS (backfill sem re-scrap)...")
+    lib = load_library()
+    campos = (("logo_url", logo_url), ("poster", poster_url))
+
+    if not any(not a.get(campo) for a in lib["animes"] for campo, _ in campos):
+        print("[DONE] Nada a preencher.")
         return
 
-    api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_PATH}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    all_series = get_all_series(user_id, api_key)
+    by_id = {s["id"]: s for s in all_series}
+    by_name: Dict[str, List[Dict]] = {}
+    for s in all_series:
+        by_name.setdefault(_norm(s["name"]), []).append(s)
 
-    # 1. pega o SHA atual do arquivo (necessário para o PUT)
-    sha = None
+    filled = {campo: 0 for campo, _ in campos}
+    not_found = 0
+    for anime in lib["animes"]:
+        if all(anime.get(campo) for campo, _ in campos):
+            continue
+        serie = by_id.get(anime["id"])
+        if serie is None:
+            candidatos = by_name.get(_norm(anime.get("name")), [])
+            serie = candidatos[0] if len(candidatos) == 1 else None
+        if serie is None:
+            print(f"[WARN] '{anime.get('name')}' não encontrado no Jellyfin (id/nome). Pulando.")
+            not_found += 1
+            continue
+        for campo, builder in campos:
+            if not anime.get(campo):
+                value = builder(serie)
+                if value:
+                    anime[campo] = value
+                    filled[campo] += 1
+
+    save_library(lib)
+    print(f"[DONE] logo_url: {filled['logo_url']} | poster: {filled['poster']} | não encontrados: {not_found}.")
+
+
+def mode_scrap(api_key: str, user_id: str, name: str):
+    print(f"[INFO] Buscando '{name}'...")
+    all_series = get_all_series(user_id, api_key)
+    q = _norm(name)
+    exact = [s for s in all_series if _norm(s["name"]) == q]
+    matches = exact or [s for s in all_series if q in _norm(s["name"])]
+    if not matches:
+        print("[ERROR] Anime não encontrado.")
+        return
+    if not exact and len(matches) > 1:
+        nomes = ", ".join(m["name"] for m in matches[:5])
+        print(f"[WARN] {len(matches)} resultados parciais ({nomes}{'...' if len(matches) > 5 else ''}). Usando o primeiro.")
+
+    target = matches[0]
+    result = scrape_anime(target["id"], target, api_key, user_id)
+    if not result:
+        return
+
+    lib = load_library()
+    for i, a in enumerate(lib["animes"]):
+        if a["id"] == result["id"]:
+            lib["animes"][i] = result  # re-scrap substitui, não duplica
+            break
+    else:
+        lib["animes"].append(result)
+    save_library(lib)
+    print(f"[OK] Scrapado: {result['name']}")
+
+
+def mode_farm(api_key: str, user_id: str, count: int = 5):
+    lib = load_library()
+    known = {a["id"] for a in lib["animes"]}
+    available = [s for s in get_all_series(user_id, api_key)
+                 if s["id"] not in known and not is_nsfw(s["metadata"])]
+    if not available:
+        print("[FARM] Nenhum anime novo disponível.")
+        return
+
+    pick = random.sample(available, min(count, len(available)))
     try:
-        r = requests.get(api, headers=headers, timeout=15)
-        if r.ok:
-            sha = r.json().get("sha")
-    except Exception as e:
-        print(f"  ⚠ não consegui ler SHA atual: {e}")
+        for s in pick:
+            result = scrape_anime(s["id"], s, api_key, user_id)
+            if result:
+                lib["animes"].append(result)
+                print(f"[FARM] Adicionado: {result['name']}")
+    finally:
+        save_library(lib)
 
-    # 2. lê e codifica o arquivo
-    with open(LIBRARY_FILE, "rb") as f:
-        conteudo_b64 = _b64.b64encode(f.read()).decode()
 
-    agora = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    body  = {
-        "message": f"auto: atualiza biblioteca ({agora})",
-        "content": conteudo_b64,
-        "branch":  GITHUB_BRANCH,
-    }
-    if sha:
-        body["sha"] = sha
+def mode_fix_names(api_key: str):
+    # Estrutura para integração com AniList GraphQL
+    # Requer TOKEN_ANILIST nas variáveis de ambiente
+    print("[INFO] Fix-names aguarda implementação de mutação AniList. Placeholder pronto.")
+    pass
 
-    # 3. faz o PUT
-    try:
-        r = requests.put(api, headers=headers, json=body, timeout=60)
-        if r.ok:
-            print(f"  ✓ biblioteca enviada ao GitHub ({GITHUB_REPO}/{GITHUB_PATH})")
-        else:
-            print(f"  ✗ erro no push: {r.status_code} — {r.text[:200]}")
-    except Exception as e:
-        print(f"  ✗ falha no push: {e}")
 
-# ── main ──────────────────────────────────────────────────────────────────────
+def mode_import_jsons(api_key: str):
+    lib = load_library()
+    existing_ids = {a["id"] for a in lib["animes"]}
+    files = sorted(glob.glob("./imports/*.json"))
+    merged = 0
+    for fpath in files:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                chunk = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[WARN] Ignorando {fpath}: {e}")
+            continue
+        for anime in chunk.get("animes", []):
+            if anime["id"] not in existing_ids:
+                lib["animes"].append(anime)
+                existing_ids.add(anime["id"])
+                merged += 1
+    save_library(lib)
+    print(f"[IMPORT] {merged} animes fundidos.")
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI & MAIN
+# ──────────────────────────────────────────────────────────────────────────────
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--api-key",    required=True)
-    p.add_argument("--user-id",    default=None)
-    p.add_argument("--anime",      default=None)
-    p.add_argument("--no-tag",     action="store_true")
-    p.add_argument("--farm-count", type=int, default=50)
-    p.add_argument("--workers",    type=int, default=8)
-    p.add_argument("--github-token", default=os.environ.get("GITHUB_TOKEN"),
-                   help="PAT do GitHub para push automático (ou env GITHUB_TOKEN)")
-    p.add_argument("--pull-github", action="store_true",
-                   help="baixa a biblioteca atual do GitHub antes de rodar (para uso no Render)")
-    p.add_argument("--mode",
-        choices=["scrap","all","farm","update-library","import-jsons","fix-names","patch-logos"],
-        default=None)
-    args = p.parse_args()
-
-    if not args.mode:
-        print("\n  AniStream Scraper")
-        print("  ──────────────────────────────────────────────────────")
-        print("  [1] Scrap          — busca um anime e adiciona")
-        print("  [2] Baixar tudo    — scrapa TODOS (retoma de onde parou)")
-        print("  [3] Farm           — sorteia N aleatórios ainda não baixados")
-        print("  [4] Atualizar bib  — renova todos os links")
-        print("  [5] Importar JSONs — absorve JSONs avulsos da pasta")
-        print("  [6] Corrigir nomes — corrige títulos via AniList")
-        print("  [7] Patch logos    — preenche logo_url em toda a biblioteca")
-        choice = input("\n  escolha (1-7): ").strip()
-        args.mode = {"1":"scrap","2":"all","3":"farm","4":"update-library",
-                     "5":"import-jsons","6":"fix-names","7":"patch-logos"}.get(choice, "scrap")
-
-    if args.mode == "import-jsons":
-        mode_scrap_legacy_jsons(); sys.exit(0)
-    if args.mode == "fix-names":
-        mode_fix_names(); sys.exit(0)
-    if args.mode == "patch-logos":
-        if args.pull_github:
-            print("  baixando biblioteca do GitHub…"); pull_from_github()
-        s = make_session(args.api_key)
-        user_id = args.user_id or get_user_id(s)
-        if not user_id:
-            print("  não consegui resolver o UserId."); sys.exit(1)
-        mode_patch_logos(s, user_id)
-        if args.github_token:
-            print("\n  enviando para o GitHub…"); push_to_github(args.github_token)
-        sys.exit(0)
+    parser = argparse.ArgumentParser(description="AniStream Scraper & Library Manager")
+    parser.add_argument("--mode", choices=["all", "update-library", "patch-logos", "scrap", "farm", "fix-names", "import-jsons"], required=True)
+    parser.add_argument("--anime", help="Nome exato ou parcial para modo scrap")
+    parser.add_argument("--farm-count", type=int, default=5, help="Quantidade para modo farm")
+    parser.add_argument("--limit", type=int, default=0, help="Limite de itens para modo all")
+    args = parser.parse_args()
 
     if args.mode == "scrap" and not args.anime:
-        args.anime = input("  nome do anime: ").strip()
-        if not args.anime:
-            print("  nome vazio."); sys.exit(1)
+        parser.error("--mode scrap requer --anime")
 
-    # no Render o disco é efêmero — baixa o estado atual do GitHub antes de rodar
-    if args.pull_github:
-        print("  baixando biblioteca do GitHub…")
-        pull_from_github()
+    if not os.environ.get("ANISTREAM_API_KEY"):
+        print("[FATAL] ANISTREAM_API_KEY não definida no ambiente.")
+        sys.exit(1)
+    if not os.environ.get("ANISTREAM_USER_ID"):
+        print("[FATAL] ANISTREAM_USER_ID não definida no ambiente.")
+        sys.exit(1)
 
-    s = make_session(args.api_key)
-    print("  autenticando...")
-    user_id = args.user_id or get_user_id(s)
-    if not user_id:
-        print("  não consegui resolver o UserId. passe com --user-id."); sys.exit(1)
-    print(f"  userId: {user_id}\n")
+    api_key = os.environ["ANISTREAM_API_KEY"]
+    user_id = os.environ["ANISTREAM_USER_ID"]
 
-    if   args.mode == "scrap":          mode_scrap(s, user_id, args)
-    elif args.mode == "all":            mode_all(s, user_id, args)
-    elif args.mode == "farm":           mode_farm(s, user_id, args)
-    elif args.mode == "update-library": mode_update_library(s, user_id, args)
+    if args.mode in ("all", "scrap", "farm") and not any(
+            FILTERS[k] for k in ("genres", "tags", "keywords", "title_blocks")):
+        print("[WARN] Filtros NSFW vazios (variáveis NSFW_*_B64 ausentes ou inválidas): "
+              "NENHUM conteúdo será filtrado nesta execução.")
 
-    # push automático ao GitHub se token disponível
-    if args.github_token and args.mode in ("all", "farm", "update-library", "scrap", "patch-logos"):
-        print("\n  enviando para o GitHub…")
-        push_to_github(args.github_token)
+    routes = {
+        "all": lambda: mode_all(api_key, user_id, args.limit),
+        "update-library": lambda: mode_update_library(api_key),
+        "patch-logos": lambda: mode_patch_logos(api_key, user_id),
+        "scrap": lambda: mode_scrap(api_key, user_id, args.anime),
+        "farm": lambda: mode_farm(api_key, user_id, args.farm_count),
+        "fix-names": lambda: mode_fix_names(api_key),
+        "import-jsons": lambda: mode_import_jsons(api_key),
+    }
+
+    try:
+        routes[args.mode]()
+    except KeyboardInterrupt:
+        print("\n[INTERRUPT] Operação abortada pelo usuário.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n[FATAL] Erro inesperado: {e}")
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
