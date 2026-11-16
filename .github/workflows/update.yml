@@ -1,4 +1,4 @@
-name: Atualizar Biblioteca
+name: Atualizar Biblioteca Gulosa
 
 on:
   schedule:
@@ -36,8 +36,7 @@ jobs:
           python anistream_scraper.py \
             --api-key "$ANISTREAM_API_KEY" \
             --user-id "$ANISTREAM_USER_ID" \
-            --mode update-library \
-            --workers 6
+            --mode update-library
 
       - name: Commitar e enviar JSON atualizado
         run: |
