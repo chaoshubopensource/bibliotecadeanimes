@@ -8,13 +8,13 @@ Modos: all | update-library | patch-logos | scrap | farm | fix-names | import-js
 import argparse
 import base64
 import glob
-import hashlib
 import json
 import os
 import random
+import secrets
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
@@ -27,8 +27,8 @@ LIBRARY_PATH = "biblioteca_completa.json"
 REQUEST_TIMEOUT = 15  # segundos
 PAGE_SIZE = 500       # itens por página nas listagens do Jellyfin
 
-# Gera DeviceId persistente para evitar bloqueios por mudança frequente
-DEVICE_ID = hashlib.sha256("AniLibScraper-v1".encode()).hexdigest()[:32]
+# DeviceId fixo — o servidor Jellyfin usa para rastrear sessões; não alterar.
+DEVICE_ID = "a9d0ebde-e77e-48d6-a6ee-cbfa9c991c1f"
 
 # Parâmetros fixos da URL HLS (main.m3u8).
 # AudioCodec=copy: browsers não decodificam AC3/EAC3 via MSE; o frontend converte
@@ -71,7 +71,14 @@ FILTERS = {
 
 
 def _headers(api_key: str) -> Dict[str, str]:
-    return {"X-Emby-Token": api_key}
+    return {
+        "Authorization": (
+            f'MediaBrowser Token="{api_key}", Client="Jellyfin Web", '
+            f'Device="Chrome", DeviceId="{DEVICE_ID}", Version="10.9.11"'
+        ),
+        "Accept": "application/json",
+        "Connection": "keep-alive",
+    }
 
 
 def _api_get(endpoint: str, params: Optional[Dict] = None, **kwargs) -> requests.Response:
@@ -293,7 +300,7 @@ def build_hls_url(item_id: str, playback: Dict, api_key: str, audio_idx: int) ->
         "DeviceId": DEVICE_ID,
         "MediaSourceId": playback["media_source_id"],
         "AudioStreamIndex": audio_idx,
-        "PlaySessionId": hashlib.md5(time.time().__repr__().encode()).hexdigest()[:16],
+        "PlaySessionId": secrets.token_hex(16),
         "ApiKey": api_key,
     }
     return f"{BASE_URL}/videos/{item_id}/main.m3u8?{urlencode(params)}"
