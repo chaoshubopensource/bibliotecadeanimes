@@ -19,8 +19,8 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Instalar dependências
-        run: pip install requests urllib3
+      - name: Verificar dependências (já incluídas no ubuntu-latest)
+        run: python -c "import requests, urllib3; print(f'requests {requests.__version__} / urllib3 {urllib3.__version__}')"
 
       - name: Sync (novos animes + episódios, humanizado com checkpoint)
         env:
