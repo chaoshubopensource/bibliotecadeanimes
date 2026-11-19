@@ -7,6 +7,7 @@ Modos: all | update-library | patch-logos | scrap | farm | fix-names | import-js
 
 import argparse
 import base64
+import functools
 import glob
 import json
 import os
@@ -14,6 +15,10 @@ import random
 import secrets
 import sys
 import time
+
+import builtins
+# Força flush imediato em todo print — sem isso o GitHub Actions bufferiza stdout e nada aparece no log.
+print = functools.partial(builtins.print, flush=True)
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -90,9 +95,16 @@ FILTERS = {
 }
 
 
-def _human_sleep(min_s: float = 4.0, max_s: float = 12.0):
-    """Pausa aleatória humanizada entre requests — evita fingerprint de bot pelo Cloudflare WAF."""
+def _human_sleep(min_s: float = 5.0, max_s: float = 12.0):
+    """Pausa longa — usada em resoluções de episódio (MediaStreams + PlaybackInfo).
+    Essas são as chamadas que disparam o ban: uma por episódio, em sequência."""
     time.sleep(random.uniform(min_s, max_s))
+
+
+def _browse_sleep():
+    """Pausa curta — usada em listagens paginadas (séries, episódios).
+    Listagens são poucos requests (1-3 páginas por anime) e menos suspeitas."""
+    time.sleep(random.uniform(1.0, 2.5))
 
 
 def _headers(api_key: str) -> Dict[str, str]:
@@ -179,9 +191,10 @@ def _api_get(endpoint: str, params: Optional[Dict] = None, _no_sleep: bool = Fal
                 last_exc = "200 HTML (Cloudflare block)"
                 continue
 
-        # Pausa humanizada após cada request bem-sucedido (não em retries — esses já têm backoff)
-        if not _no_sleep and attempt == 0 and resp.status_code < 400:
-            _human_sleep()
+        # Pausa curta de browse após cada request bem-sucedido em listagens.
+        # Resoluções de episódio usam _human_sleep() diretamente após retornar.
+        if not _no_sleep and resp.status_code < 400:
+            _browse_sleep()
         return resp
     raise requests.exceptions.ConnectionError(f"falhou após 5 tentativas: {last_exc}")
 
@@ -281,7 +294,7 @@ def get_all_series(user_id: str, api_key: str) -> List[Dict]:
             "StartIndex": start,
             "Limit": PAGE_SIZE,
         }
-        resp = _api_get(f"/Users/{user_id}/Items", params=params, apikey=api_key)
+        resp = _api_get(f"/Users/{user_id}/Items", params=params, apikey=api_key, _no_sleep=True)
         _check(resp, "listagem de séries (/Users/<id>/Items)")
         data = _safe_json(resp, "listagem de séries")
         page = data.get("Items", [])
@@ -314,7 +327,7 @@ def get_episodes(serie_id: str, user_id: str, api_key: str) -> List[Dict]:
             "StartIndex": start,
             "Limit": PAGE_SIZE,
         }
-        resp = _api_get(f"/Users/{user_id}/Items", params=params, apikey=api_key)
+        resp = _api_get(f"/Users/{user_id}/Items", params=params, apikey=api_key, _no_sleep=True)
         _check(resp, f"listagem de episódios de {serie_id}")
         data = _safe_json(resp, f"listagem de episódios de {serie_id}")
         page = data.get("Items", [])
@@ -342,7 +355,8 @@ def _detect_pt_streams(item_id: str, api_key: str, user_id: str = "") -> Optiona
     try:
         endpoint = (f"/Users/{user_id}/Items/{item_id}?Fields=MediaStreams"
                     if user_id else f"/Items/{item_id}?Fields=MediaStreams")
-        resp = _api_get(endpoint, apikey=api_key)
+        # _no_sleep=True: o sleep longo é feito após o bloco completo de resolve (detect + playback)
+        resp = _api_get(endpoint, apikey=api_key, _no_sleep=True)
     except requests.RequestException as e:
         print(f"[ERROR] Falha de rede ao buscar streams do item {item_id}: {e}")
         return None
@@ -493,6 +507,9 @@ def _resolve_episode(ep_id: str, api_key: str, user_id: str = "") -> Optional[Di
         return None
 
     sub = build_sub_url(ep_id, playback["media_source_id"], sub_idx, api_key) if sub_idx >= 0 else ""
+    # Sleep longo aqui: cada episódio resolvido = detect_pt_streams + PlaybackInfo
+    # São as chamadas mais frequentes e as que mais disparam o WAF
+    _human_sleep()
     return {"url": build_hls_url(ep_id, playback, api_key, audio_idx), "sub": sub}
 
 
