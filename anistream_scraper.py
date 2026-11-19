@@ -106,7 +106,9 @@ def _headers(api_key: str) -> Dict[str, str]:
         "User-Agent": _SESSION_UA,
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
+        # Accept-Encoding NÃO definido aqui: quando definido manualmente o requests para de
+        # descomprimir automaticamente o corpo gzip/br, resultando em bytes binários ilegíveis.
+        # O requests adiciona e gerencia esse header internamente.
         "Referer": f"{BASE_URL}/",
         "Origin": BASE_URL,
         "Connection": "keep-alive",
