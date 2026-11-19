@@ -24,11 +24,21 @@ import requests
 # ──────────────────────────────────────────────────────────────────────────────
 BASE_URL = "https://app.anistream.biz"
 LIBRARY_PATH = "biblioteca_completa.json"
-REQUEST_TIMEOUT = 15  # segundos
+REQUEST_TIMEOUT = 30  # segundos (aumentado — servidor pode demorar mais quando throttled)
 PAGE_SIZE = 500       # itens por página nas listagens do Jellyfin
 
 # DeviceId fixo — o servidor Jellyfin usa para rastrear sessões; não alterar.
 DEVICE_ID = "a9d0ebde-e77e-48d6-a6ee-cbfa9c991c1f"
+
+# User-Agent escolhido aleatoriamente uma vez por sessão — varia entre runs para não
+# ter fingerprint fixo. Cloudflare correlaciona UA + frequência.
+_SESSION_UA = random.choice([
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+])
 
 # Parâmetros fixos da URL HLS (main.m3u8).
 # AudioCodec=copy: browsers não decodificam AC3/EAC3 via MSE; o frontend converte
@@ -80,24 +90,40 @@ FILTERS = {
 }
 
 
+def _human_sleep(min_s: float = 4.0, max_s: float = 12.0):
+    """Pausa aleatória humanizada entre requests — evita fingerprint de bot pelo Cloudflare WAF."""
+    time.sleep(random.uniform(min_s, max_s))
+
+
 def _headers(api_key: str) -> Dict[str, str]:
+    """Headers que imitam um browser Chrome real. O Cloudflare inspeciona o conjunto completo."""
     return {
         "Authorization": (
             f'MediaBrowser Token="{api_key}", Client="Jellyfin Web", '
             f'Device="Chrome", DeviceId="{DEVICE_ID}", Version="10.9.11"'
         ),
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/130.0.0.0 Safari/537.36"
-        ),
-        "X-Emby-Token": api_key,  # header equivalente ao Token= (alguns proxies só repassam um dos dois)
-        "Accept": "application/json",
-        "Connection": "close",
+        "X-Emby-Token": api_key,
+        "User-Agent": _SESSION_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": f"{BASE_URL}/",
+        "Origin": BASE_URL,
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "sec-ch-ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
 
 
-def _api_get(endpoint: str, params: Optional[Dict] = None, **kwargs) -> requests.Response:
+def _api_get(endpoint: str, params: Optional[Dict] = None, _no_sleep: bool = False, **kwargs) -> requests.Response:
+    """GET com retry exponencial + delay humanizado após cada request bem-sucedido.
+    _no_sleep=True desativa o delay (usado em listagens de paginação onde já há pausa fora)."""
     url = f"{BASE_URL}{endpoint}"
     if params:
         url += f"?{urlencode(params)}"
@@ -105,8 +131,9 @@ def _api_get(endpoint: str, params: Optional[Dict] = None, **kwargs) -> requests
     last_exc = None
     for attempt in range(5):
         if attempt:
-            wait = 2 ** attempt
-            print(f"[RETRY] tentativa {attempt + 1}/5 após {wait}s ({last_exc})")
+            # backoff exponencial com jitter para não criar picos de tráfego
+            wait = (2 ** attempt) + random.uniform(0, 3)
+            print(f"[RETRY] tentativa {attempt + 1}/5 após {wait:.1f}s ({last_exc})")
             time.sleep(wait)
         try:
             resp = requests.get(url, headers=_headers(api_key), timeout=REQUEST_TIMEOUT, stream=False)
@@ -122,14 +149,26 @@ def _api_get(endpoint: str, params: Optional[Dict] = None, **kwargs) -> requests
                 resp2 = requests.get(f"{url}{sep}{urlencode({'api_key': api_key})}",
                                      headers=_headers(api_key), timeout=REQUEST_TIMEOUT, stream=False)
                 if resp2.status_code != 401:
+                    if not _no_sleep:
+                        _human_sleep()
                     return resp2
             except requests.exceptions.RequestException:
                 pass
+        if resp.status_code == 429:
+            # Rate-limited: espera mais antes de tentar de novo
+            retry_after = int(resp.headers.get("Retry-After", 60))
+            wait = max(retry_after, 30) + random.uniform(5, 15)
+            print(f"[RATE-LIMIT] 429 recebido. Aguardando {wait:.0f}s antes de continuar...")
+            time.sleep(wait)
+            last_exc = "HTTP 429"
+            continue
         if resp.status_code in RETRY_STATUS and attempt < 4:
             last_exc = f"HTTP {resp.status_code}"
             continue
+        # Pausa humanizada após cada request bem-sucedido (não em retries — esses já têm backoff)
+        if not _no_sleep and attempt == 0 and resp.status_code < 400:
+            _human_sleep()
         return resp
-    # RequestException: os try/except dos chamadores já tratam esse tipo.
     raise requests.exceptions.ConnectionError(f"falhou após 5 tentativas: {last_exc}")
 
 
@@ -569,12 +608,31 @@ def scrape_anime(serie_id: str, serie_data: Dict, api_key: str, user_id: str) ->
     }
 
 
-def mode_sync(api_key: str, user_id: str):
+def mode_sync(api_key: str, user_id: str, max_runtime_min: int = 0):
     """Modo inteligente: adiciona animes/episódios novos sem varrer tudo.
     Usa RecursiveItemCount da listagem (zero requests extras) pra detectar mudança.
-    Só chama get_episodes quando o contador diverge do que está salvo."""
+    Só chama get_episodes quando o contador diverge do que está salvo.
+
+    Suporta execuções parciais: salva checkpoint em lib["_sync_checkpoint"] e retoma
+    de onde parou no próximo run. max_runtime_min=0 significa sem limite de tempo.
+    """
+    _run_start = time.time()
+
+    def _tempo_ok() -> bool:
+        """False quando o tempo limite foi ultrapassado."""
+        if not max_runtime_min:
+            return True
+        elapsed = (time.time() - _run_start) / 60
+        return elapsed < max_runtime_min
+
     print("[INFO] Iniciando SYNC (novos animes + episódios novos)...")
     lib = load_library()
+
+    # Checkpoint: IDs já processados neste ciclo. Quando varrer tudo, o checkpoint é apagado.
+    checkpoint: set = set(lib.get("_sync_checkpoint", {}).get("done", []))
+    if checkpoint:
+        print(f"[CHECKPOINT] Retomando ciclo anterior — {len(checkpoint)} animes já processados.")
+
     _ensure_full_ids(lib, user_id, api_key)
     save_library(lib)
 
@@ -582,15 +640,29 @@ def mode_sync(api_key: str, user_id: str):
     lib_by_id: Dict[str, Dict] = {_clean_id(a["id"]): a for a in lib["animes"]}
 
     novos = atualizados = sem_mudanca = 0
+    parou_por_tempo = False
 
     try:
         for s in all_series:
+            if not _tempo_ok():
+                parou_por_tempo = True
+                print(f"[CHECKPOINT] Limite de {max_runtime_min}min atingido. "
+                      f"Salvando progresso — próximo run continua daqui.")
+                break
+
             sid = s["id"]
+
+            # Pula animes já processados neste ciclo
+            if sid in checkpoint:
+                sem_mudanca += 1
+                continue
+
             anime_salvo = lib_by_id.get(sid)
 
             if anime_salvo is None:
                 # ── anime novo ──────────────────────────────────────────────
                 if is_nsfw(s["metadata"]):
+                    checkpoint.add(sid)
                     continue
                 result = scrape_anime(sid, s, api_key, user_id)
                 if result:
@@ -598,16 +670,19 @@ def mode_sync(api_key: str, user_id: str):
                     lib_by_id[sid] = result
                     novos += 1
                     print(f"[NEW] {result['name']} ({len(result['episodes'])} eps)")
-                    if novos % 5 == 0: save_library(lib)
+                checkpoint.add(sid)
+                lib["_sync_checkpoint"] = {"done": list(checkpoint)}
+                if novos % 5 == 0 or novos == 1:
+                    save_library(lib)
                 continue
 
             # ── anime existente: compara contagem via RecursiveItemCount ─────
-            # RecursiveItemCount vem de graça na listagem — zero requests extras
             meta = s["metadata"]
             count_server = meta.get("RecursiveItemCount") or meta.get("ChildCount") or 0
             count_local = len(anime_salvo.get("episodes", []))
 
             if count_server and count_server <= count_local:
+                checkpoint.add(sid)
                 sem_mudanca += 1
                 continue
 
@@ -616,18 +691,23 @@ def mode_sync(api_key: str, user_id: str):
                 eps_jellyfin = get_episodes(sid, user_id, api_key)
             except requests.RequestException as e:
                 print(f"[WARN] Falha ao listar eps de '{anime_salvo.get('name')}': {e}")
+                # não marca como done — tenta de novo no próximo run
                 continue
 
             eps_salvas = {_clean_id(e["id"]) for e in anime_salvo.get("episodes", [])}
             eps_novos = [ep for ep in eps_jellyfin if ep["Id"] not in eps_salvas]
 
             if not eps_novos:
+                checkpoint.add(sid)
                 sem_mudanca += 1
                 continue
 
             print(f"[UPDATE] {anime_salvo.get('name')}: {len(eps_novos)} ep(s) novo(s)")
             adicionados = 0
             for ep in eps_novos:
+                if not _tempo_ok():
+                    parou_por_tempo = True
+                    break
                 resolved = _resolve_episode(ep["Id"], api_key, user_id)
                 if resolved:
                     num = str(count_local + adicionados + 1)
@@ -638,18 +718,41 @@ def mode_sync(api_key: str, user_id: str):
                         "sub": resolved["sub"],
                     })
                     adicionados += 1
+
             if not anime_salvo.get("logo_url"):
                 anime_salvo["logo_url"] = logo_url(s)
             if not anime_salvo.get("poster"):
                 anime_salvo["poster"] = poster_url(s)
+
             if adicionados:
                 atualizados += 1
-                save_library(lib)
+
+            if not parou_por_tempo:
+                checkpoint.add(sid)
+
+            lib["_sync_checkpoint"] = {"done": list(checkpoint)}
+            save_library(lib)
+
+            if parou_por_tempo:
+                break
+
+        else:
+            # loop terminou sem break = varreu tudo neste ciclo → limpa checkpoint
+            if "_sync_checkpoint" in lib:
+                del lib["_sync_checkpoint"]
+            print("[CHECKPOINT] Ciclo completo. Checkpoint apagado.")
 
     finally:
+        lib["_sync_checkpoint"] = {"done": list(checkpoint)}
         save_library(lib)
+        # Se ciclo terminou limpo, já foi apagado antes do finally — garante limpeza
+        if not parou_por_tempo and "_sync_checkpoint" in lib:
+            del lib["_sync_checkpoint"]
+            save_library(lib)
 
-    print(f"[DONE] Novos: {novos} | Atualizados: {atualizados} | Sem mudança: {sem_mudanca}.")
+    status = "PAUSADO (continua no próximo run)" if parou_por_tempo else "CONCLUÍDO"
+    print(f"[DONE/{status}] Novos: {novos} | Atualizados: {atualizados} | Sem mudança: {sem_mudanca} "
+          f"| Checkpoint: {len(checkpoint)} animes marcados.")
 
 
 def mode_all(api_key: str, user_id: str, limit: int = 0):
@@ -863,6 +966,9 @@ def main():
     parser.add_argument("--anime", help="Nome exato ou parcial para modo scrap")
     parser.add_argument("--farm-count", type=int, default=5, help="Quantidade para modo farm")
     parser.add_argument("--limit", type=int, default=0, help="Limite de itens para modo all")
+    parser.add_argument("--max-runtime", type=int, default=0,
+                        help="Tempo máximo de execução em minutos para modo sync (0=sem limite). "
+                             "Salva checkpoint e para limpo quando o tempo for atingido.")
     parser.add_argument("--api-key", help="API key do Jellyfin (padrão: env ANISTREAM_API_KEY; prefira a variável de ambiente)")
     parser.add_argument("--user-id", help="User ID do Jellyfin (padrão: env ANISTREAM_USER_ID)")
     args = parser.parse_args()
@@ -893,7 +999,7 @@ def main():
               "NENHUM conteúdo será filtrado nesta execução.")
 
     routes = {
-        "sync": lambda: mode_sync(api_key, user_id),
+        "sync": lambda: mode_sync(api_key, user_id, args.max_runtime),
         "all": lambda: mode_all(api_key, user_id, args.limit),
         "update-library": lambda: mode_update_library(api_key, user_id),
         "patch-logos": lambda: mode_patch_logos(api_key, user_id),
