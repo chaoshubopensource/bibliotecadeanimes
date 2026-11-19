@@ -10,8 +10,8 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
-    # GitHub Actions mata jobs após 6h; saímos limpos aos 55min para o commit sempre acontecer.
-    timeout-minutes: 60
+    # --max-runtime 50 para o sync limpo aos 50min; o commit sempre acontece antes do timeout do GitHub (6h).
+    timeout-minutes: 58
     permissions:
       contents: write
 
@@ -26,9 +26,10 @@ jobs:
         env:
           ANISTREAM_API_KEY: ${{ secrets.ANISTREAM_API_KEY }}
           ANISTREAM_USER_ID: ${{ secrets.ANISTREAM_USER_ID }}
+          PYTHONUNBUFFERED: "1"
         run: |
           # --max-runtime 50 → para limpo aos 50min, salva checkpoint, próximo run continua
-          python anistream_scraper.py \
+          python -u anistream_scraper.py \
             --api-key "$ANISTREAM_API_KEY" \
             --user-id "$ANISTREAM_USER_ID" \
             --mode sync \
