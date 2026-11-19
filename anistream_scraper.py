@@ -165,6 +165,18 @@ def _api_get(endpoint: str, params: Optional[Dict] = None, _no_sleep: bool = Fal
         if resp.status_code in RETRY_STATUS and attempt < 4:
             last_exc = f"HTTP {resp.status_code}"
             continue
+        # Cloudflare às vezes retorna 200 com HTML (captcha / JS challenge) em vez de JSON.
+        # Detecta pelo Content-Type e trata como erro retryável com backoff longo.
+        if resp.status_code == 200:
+            ct = resp.headers.get("Content-Type", "")
+            if "text/html" in ct:
+                wait_cf = 30 + random.uniform(10, 30)
+                print(f"[CLOUDFLARE] Resposta HTML recebida (bloqueio/challenge). "
+                      f"Aguardando {wait_cf:.0f}s antes de tentar novamente...")
+                time.sleep(wait_cf)
+                last_exc = "200 HTML (Cloudflare block)"
+                continue
+
         # Pausa humanizada após cada request bem-sucedido (não em retries — esses já têm backoff)
         if not _no_sleep and attempt == 0 and resp.status_code < 400:
             _human_sleep()
@@ -191,6 +203,25 @@ def _check(resp: requests.Response, what: str) -> None:
         print("[HINT] Confira ANISTREAM_API_KEY/ANISTREAM_USER_ID, as permissões desse usuário no Jellyfin "
               "ou bloqueio por IP/WAF (corpo em HTML + cf-ray indica bloqueio do Cloudflare).")
     resp.raise_for_status()
+
+
+def _safe_json(resp: requests.Response, what: str) -> Dict:
+    """Parseia JSON da resposta; lança RequestException com mensagem clara se o corpo for HTML
+    (Cloudflare block/captcha que escapou da detecção em _api_get)."""
+    try:
+        return resp.json()
+    except ValueError:
+        ct = resp.headers.get("Content-Type", "")
+        body = resp.text[:400]
+        if "text/html" in ct or body.strip().startswith("<"):
+            raise requests.exceptions.RequestException(
+                f"[CLOUDFLARE] Resposta HTML em vez de JSON em '{what}' "
+                f"(status={resp.status_code}). O servidor está bloqueando temporariamente. "
+                "O próximo run deve funcionar após o cooldown."
+            )
+        raise requests.exceptions.RequestException(
+            f"JSON inválido em '{what}' (status={resp.status_code}): {body[:200]}"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -250,7 +281,7 @@ def get_all_series(user_id: str, api_key: str) -> List[Dict]:
         }
         resp = _api_get(f"/Users/{user_id}/Items", params=params, apikey=api_key)
         _check(resp, "listagem de séries (/Users/<id>/Items)")
-        data = resp.json()
+        data = _safe_json(resp, "listagem de séries")
         page = data.get("Items", [])
         items.extend(page)
         start += len(page)
@@ -283,7 +314,7 @@ def get_episodes(serie_id: str, user_id: str, api_key: str) -> List[Dict]:
         }
         resp = _api_get(f"/Users/{user_id}/Items", params=params, apikey=api_key)
         _check(resp, f"listagem de episódios de {serie_id}")
-        data = resp.json()
+        data = _safe_json(resp, f"listagem de episódios de {serie_id}")
         page = data.get("Items", [])
         episodes.extend(page)
         start += len(page)
