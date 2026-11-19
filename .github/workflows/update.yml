@@ -1,4 +1,4 @@
-name: update
+name: Atualizar Biblioteca
 
 on:
   schedule:
@@ -21,16 +21,6 @@ jobs:
 
       - name: Instalar dependências
         run: pip install requests urllib3
-
-      - name: Patch logos (backfill de logo_url/poster vazios)
-        env:
-          ANISTREAM_API_KEY: ${{ secrets.ANISTREAM_API_KEY }}
-          ANISTREAM_USER_ID: ${{ secrets.ANISTREAM_USER_ID }}
-        run: |
-          python anistream_scraper.py \
-            --api-key "$ANISTREAM_API_KEY" \
-            --user-id "$ANISTREAM_USER_ID" \
-            --mode patch-logos
 
       - name: Sync (novos animes + episódios, humanizado com checkpoint)
         env:
