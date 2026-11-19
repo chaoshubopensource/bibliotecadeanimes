@@ -1,13 +1,17 @@
-name: Atualizar Biblioteca
+name: update
 
 on:
   schedule:
-    - cron: "0 7 * * *"
+    # Roda de 2 em 2 horas. O sync salva checkpoint — cada run continua de onde o anterior parou.
+    # Um ciclo completo (1138 animes com delay humanizado ~8s/req) leva ~2–3 dias.
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    # GitHub Actions mata jobs após 6h; saímos limpos aos 55min para o commit sempre acontecer.
+    timeout-minutes: 60
     permissions:
       contents: write
 
@@ -18,7 +22,7 @@ jobs:
       - name: Instalar dependências
         run: pip install requests urllib3
 
-      - name: Patch logos (preenche logo_url nos animes sem o campo)
+      - name: Patch logos (backfill de logo_url/poster vazios)
         env:
           ANISTREAM_API_KEY: ${{ secrets.ANISTREAM_API_KEY }}
           ANISTREAM_USER_ID: ${{ secrets.ANISTREAM_USER_ID }}
@@ -28,15 +32,17 @@ jobs:
             --user-id "$ANISTREAM_USER_ID" \
             --mode patch-logos
 
-      - name: Sync (novos animes + episodios novos)
+      - name: Sync (novos animes + episódios, humanizado com checkpoint)
         env:
           ANISTREAM_API_KEY: ${{ secrets.ANISTREAM_API_KEY }}
           ANISTREAM_USER_ID: ${{ secrets.ANISTREAM_USER_ID }}
         run: |
+          # --max-runtime 50 → para limpo aos 50min, salva checkpoint, próximo run continua
           python anistream_scraper.py \
             --api-key "$ANISTREAM_API_KEY" \
             --user-id "$ANISTREAM_USER_ID" \
-            --mode sync
+            --mode sync \
+            --max-runtime 50
 
       - name: Commitar e enviar JSON atualizado
         run: |
