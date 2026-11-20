@@ -32,17 +32,22 @@ LIBRARY_PATH = "biblioteca_completa.json"
 REQUEST_TIMEOUT = 30  # segundos (aumentado — servidor pode demorar mais quando throttled)
 PAGE_SIZE = 500       # itens por página nas listagens do Jellyfin
 
-# DeviceId fixo — o servidor Jellyfin usa para rastrear sessões; não alterar.
-DEVICE_ID = "a9d0ebde-e77e-48d6-a6ee-cbfa9c991c1f"
+# DeviceId gerado aleatoriamente por sessão — um UUID4 novo a cada run.
+# DeviceId fixo é o maior red flag: o servidor vê sempre o mesmo "dispositivo"
+# fazendo milhares de requests sem nenhuma sessão real de usuário. UUID aleatório
+# simula um browser diferente em cada execução.
+DEVICE_ID = str(__import__("uuid").uuid4())
 
-# User-Agent escolhido aleatoriamente uma vez por sessão — varia entre runs para não
-# ter fingerprint fixo. Cloudflare correlaciona UA + frequência.
+# User-Agent escolhido aleatoriamente uma vez por sessão.
 _SESSION_UA = random.choice([
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
 ])
 
 # Parâmetros fixos da URL HLS (main.m3u8).
@@ -95,16 +100,27 @@ FILTERS = {
 }
 
 
-def _human_sleep(min_s: float = 5.0, max_s: float = 12.0):
+def _human_sleep(min_s: float = 6.0, max_s: float = 18.0):
     """Pausa longa — usada em resoluções de episódio (MediaStreams + PlaybackInfo).
-    Essas são as chamadas que disparam o ban: uma por episódio, em sequência."""
-    time.sleep(random.uniform(min_s, max_s))
+    Essas são as chamadas que disparam o ban: uma por episódio, em sequência.
+    1% de chance de pausa extra longa (20-60s) simulando usuário distraído."""
+    t = random.uniform(min_s, max_s)
+    if random.random() < 0.08:  # 8%: pausa longa ocasional
+        t += random.uniform(20, 50)
+        print(f"[HUMAN] Pausa longa ({t:.0f}s)...")
+    time.sleep(t)
 
 
 def _browse_sleep():
-    """Pausa curta — usada em listagens paginadas (séries, episódios).
-    Listagens são poucos requests (1-3 páginas por anime) e menos suspeitas."""
-    time.sleep(random.uniform(1.0, 2.5))
+    """Pausa entre requests de listagem. Mais curta que _human_sleep mas ainda variada."""
+    t = random.uniform(1.5, 4.0)
+    time.sleep(t)
+
+
+def _anime_change_sleep():
+    """Pausa ao trocar de anime — simula usuário clicando, lendo sinopse, etc."""
+    t = random.uniform(5.0, 15.0)
+    time.sleep(t)
 
 
 def _headers(api_key: str) -> Dict[str, str]:
@@ -683,8 +699,14 @@ def mode_sync(api_key: str, user_id: str, max_runtime_min: int = 0):
     if checkpoint:
         print(f"[CHECKPOINT] Retomando ciclo anterior — {len(checkpoint)} animes já processados.")
 
-    _ensure_full_ids(lib, user_id, api_key)
-    save_library(lib)
+    try:
+        _ensure_full_ids(lib, user_id, api_key)
+        save_library(lib)
+    except requests.exceptions.HTTPError as _iderr:
+        if _iderr.response is not None and _iderr.response.status_code == 401:
+            print("[WARN] 401 ao reparar IDs truncados — pulando reparo, continuando com IDs existentes.")
+        else:
+            raise
 
     all_series = get_all_series(user_id, api_key)
     lib_by_id: Dict[str, Dict] = {_clean_id(a["id"]): a for a in lib["animes"]}
@@ -714,6 +736,7 @@ def mode_sync(api_key: str, user_id: str, max_runtime_min: int = 0):
                 if is_nsfw(s["metadata"]):
                     checkpoint.add(sid)
                     continue
+                _anime_change_sleep()
                 result = scrape_anime(sid, s, api_key, user_id)
                 if result:
                     lib["animes"].append(result)
@@ -737,6 +760,7 @@ def mode_sync(api_key: str, user_id: str, max_runtime_min: int = 0):
                 continue
 
             # contagem divergiu: busca eps reais pra saber quais são novos
+            _anime_change_sleep()
             try:
                 eps_jellyfin = get_episodes(sid, user_id, api_key)
             except requests.RequestException as e:
@@ -1047,6 +1071,22 @@ def main():
             FILTERS[k] for k in ("genres", "tags", "keywords", "title_blocks")):
         print("[WARN] Filtros NSFW vazios (variáveis NSFW_*_B64 ausentes ou inválidas): "
               "NENHUM conteúdo será filtrado nesta execução.")
+
+    # ── health-check de autenticação ────────────────────────────────────────
+    # Faz uma request leve antes de qualquer modo que usa a API.
+    # Se 401 → credencial inválida → mensagem clara e saída limpa (exit 0,
+    # não polui o log de CI com stack trace).
+    if needs_key:
+        try:
+            probe = _api_get("/System/Info", apikey=api_key, _no_sleep=True)
+            if probe.status_code == 401:
+                print("[FATAL] Credenciais inválidas (401). "
+                      "Verifique ANISTREAM_API_KEY e ANISTREAM_USER_ID no GitHub Secrets.")
+                print("[HINT]  O token Jellyfin expira quando a conta é recriada. "
+                      "Pegue o novo token em: Painel Jellyfin → Usuário → API Keys.")
+                sys.exit(0)  # exit 0 = não marca o workflow como falho
+        except requests.exceptions.RequestException as _probe_err:
+            print(f"[WARN] Health-check falhou ({_probe_err}). Tentando continuar mesmo assim...")
 
     routes = {
         "sync": lambda: mode_sync(api_key, user_id, args.max_runtime),
