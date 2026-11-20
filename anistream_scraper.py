@@ -574,13 +574,15 @@ def _find_full(short: str, candidates: List[str]) -> Optional[str]:
 
 
 def _ensure_full_ids(lib: Dict, user_id: str, api_key: str) -> int:
-    """Repara IDs truncados (anime e episódios) consultando o Jellyfin. Só faz requisições se
-    existir algum ID curto. Retorna quantos IDs foram corrigidos."""
+    """Repara apenas IDs de série truncados consultando o Jellyfin.
+    IDs de episódio truncados são resolvidos naturalmente pelo sync quando cada anime
+    é processado — não vale fazer get_episodes para cada um aqui (seriam centenas de
+    requests antes mesmo de começar o sync real).
+    Retorna quantos IDs de série foram corrigidos."""
     def _short(i: Optional[str]) -> bool:
         return not _is_full_id(_clean_id(i or ""))
 
-    precisa = any(_short(a.get("id")) or any(_short(e.get("id")) for e in a.get("episodes", []))
-                  for a in lib["animes"])
+    precisa = any(_short(a.get("id")) for a in lib["animes"])
     if not precisa:
         return 0
     if not user_id:
@@ -588,7 +590,8 @@ def _ensure_full_ids(lib: Dict, user_id: str, api_key: str) -> int:
               "não é possível repará-los.")
         return 0
 
-    print("[INFO] IDs truncados detectados na biblioteca. Reconstruindo IDs completos via Jellyfin...")
+    n_short = sum(1 for a in lib["animes"] if _short(a.get("id")))
+    print(f"[INFO] {n_short} IDs de série truncados detectados. Reconstruindo via listagem única...")
     all_series = get_all_series(user_id, api_key)
     series_ids = [s["id"] for s in all_series]
     by_name: Dict[str, List[str]] = {}
@@ -598,33 +601,19 @@ def _ensure_full_ids(lib: Dict, user_id: str, api_key: str) -> int:
     fixed = unresolved = 0
     for anime in lib["animes"]:
         aid = _clean_id(anime.get("id") or "")
-        if _short(aid):
-            full = _find_full(aid, series_ids)
-            if not full:
-                nomes = by_name.get(_norm(anime.get("name")), [])
-                full = nomes[0] if len(nomes) == 1 else None
-            if not full:
-                unresolved += 1
-                continue
+        if not _short(aid):
+            continue
+        full = _find_full(aid, series_ids)
+        if not full:
+            nomes = by_name.get(_norm(anime.get("name")), [])
+            full = nomes[0] if len(nomes) == 1 else None
+        if full:
             anime["id"] = full
             fixed += 1
         else:
-            full = aid
+            unresolved += 1
 
-        if any(_short(e.get("id")) for e in anime.get("episodes", [])):
-            try:
-                eps = get_episodes(full, user_id, api_key)
-            except requests.RequestException as e:
-                print(f"[WARN] Não foi possível listar episódios de '{anime.get('name')}' para reparar IDs: {e}")
-                continue
-            cands = [e["Id"] for e in eps] + [full]  # filme: o episódio é o próprio item
-            for ep in anime.get("episodes", []):
-                if _short(ep.get("id")):
-                    f = _find_full(_clean_id(ep.get("id") or ""), cands)
-                    if f:
-                        ep["id"] = f
-                        fixed += 1
-    print(f"[INFO] IDs reparados: {fixed} | animes sem correspondência: {unresolved}.")
+    print(f"[INFO] IDs de série reparados: {fixed} | sem correspondência: {unresolved}.")
     return fixed
 
 
@@ -675,158 +664,96 @@ def scrape_anime(serie_id: str, serie_data: Dict, api_key: str, user_id: str) ->
 
 
 def mode_sync(api_key: str, user_id: str, max_runtime_min: int = 0):
-    """Modo inteligente: adiciona animes/episódios novos sem varrer tudo.
-    Usa RecursiveItemCount da listagem (zero requests extras) pra detectar mudança.
-    Só chama get_episodes quando o contador diverge do que está salvo.
-
-    Suporta execuções parciais: salva checkpoint em lib["_sync_checkpoint"] e retoma
-    de onde parou no próximo run. max_runtime_min=0 significa sem limite de tempo.
-    """
-    _run_start = time.time()
-
-    def _tempo_ok() -> bool:
-        """False quando o tempo limite foi ultrapassado."""
-        if not max_runtime_min:
-            return True
-        elapsed = (time.time() - _run_start) / 60
-        return elapsed < max_runtime_min
-
-    print("[INFO] Iniciando SYNC (novos animes + episódios novos)...")
+    """Sync simples: varre todos os animes do Jellyfin, adiciona novos e episódios novos.
+    Salva a cada anime processado. Sem checkpoint, sem limite de tempo artificial."""
+    print("[INFO] Iniciando SYNC...")
     lib = load_library()
 
-    # Checkpoint: IDs já processados neste ciclo. Quando varrer tudo, o checkpoint é apagado.
-    checkpoint: set = set(lib.get("_sync_checkpoint", {}).get("done", []))
-    if checkpoint:
-        print(f"[CHECKPOINT] Retomando ciclo anterior — {len(checkpoint)} animes já processados.")
-
+    # Repara IDs de série truncados (apenas listagem, sem get_episodes por anime)
     try:
         _ensure_full_ids(lib, user_id, api_key)
         save_library(lib)
     except requests.exceptions.HTTPError as _iderr:
         if _iderr.response is not None and _iderr.response.status_code == 401:
-            print("[WARN] 401 ao reparar IDs truncados — pulando reparo, continuando com IDs existentes.")
+            print("[WARN] 401 ao reparar IDs — pulando, continuando com IDs existentes.")
         else:
             raise
 
     all_series = get_all_series(user_id, api_key)
     lib_by_id: Dict[str, Dict] = {_clean_id(a["id"]): a for a in lib["animes"]}
 
+    total = len(all_series)
     novos = atualizados = sem_mudanca = 0
-    parou_por_tempo = False
 
-    try:
-        for s in all_series:
-            if not _tempo_ok():
-                parou_por_tempo = True
-                print(f"[CHECKPOINT] Limite de {max_runtime_min}min atingido. "
-                      f"Salvando progresso — próximo run continua daqui.")
-                break
+    for idx, s in enumerate(all_series, 1):
+        sid = s["id"]
+        anime_salvo = lib_by_id.get(sid)
 
-            sid = s["id"]
-
-            # Pula animes já processados neste ciclo
-            if sid in checkpoint:
-                sem_mudanca += 1
+        # ── anime novo ───────────────────────────────────────────────────────
+        if anime_salvo is None:
+            if is_nsfw(s["metadata"]):
                 continue
-
-            anime_salvo = lib_by_id.get(sid)
-
-            if anime_salvo is None:
-                # ── anime novo ──────────────────────────────────────────────
-                if is_nsfw(s["metadata"]):
-                    checkpoint.add(sid)
-                    continue
-                _anime_change_sleep()
-                result = scrape_anime(sid, s, api_key, user_id)
-                if result:
-                    lib["animes"].append(result)
-                    lib_by_id[sid] = result
-                    novos += 1
-                    print(f"[NEW] {result['name']} ({len(result['episodes'])} eps)")
-                checkpoint.add(sid)
-                lib["_sync_checkpoint"] = {"done": list(checkpoint)}
-                if novos % 5 == 0 or novos == 1:
-                    save_library(lib)
-                continue
-
-            # ── anime existente: compara contagem via RecursiveItemCount ─────
-            meta = s["metadata"]
-            count_server = meta.get("RecursiveItemCount") or meta.get("ChildCount") or 0
-            count_local = len(anime_salvo.get("episodes", []))
-
-            if count_server and count_server <= count_local:
-                checkpoint.add(sid)
-                sem_mudanca += 1
-                continue
-
-            # contagem divergiu: busca eps reais pra saber quais são novos
+            print(f"[{idx}/{total}] NOVO: {s['metadata'].get('Name', sid)}")
             _anime_change_sleep()
-            try:
-                eps_jellyfin = get_episodes(sid, user_id, api_key)
-            except requests.RequestException as e:
-                print(f"[WARN] Falha ao listar eps de '{anime_salvo.get('name')}': {e}")
-                # não marca como done — tenta de novo no próximo run
-                continue
+            result = scrape_anime(sid, s, api_key, user_id)
+            if result:
+                lib["animes"].append(result)
+                lib_by_id[sid] = result
+                novos += 1
+                print(f"  → {len(result['episodes'])} eps adicionados")
+                save_library(lib)
+            continue
 
-            eps_salvas = {_clean_id(e["id"]) for e in anime_salvo.get("episodes", [])}
-            eps_novos = [ep for ep in eps_jellyfin if ep["Id"] not in eps_salvas]
+        # ── anime existente: verifica se tem eps novos via contagem ──────────
+        meta = s["metadata"]
+        count_server = meta.get("RecursiveItemCount") or meta.get("ChildCount") or 0
+        count_local = len(anime_salvo.get("episodes", []))
 
-            if not eps_novos:
-                checkpoint.add(sid)
-                sem_mudanca += 1
-                continue
+        if count_server and count_server <= count_local:
+            sem_mudanca += 1
+            continue  # sem log — não polui o output com 1000 linhas "sem mudança"
 
-            print(f"[UPDATE] {anime_salvo.get('name')}: {len(eps_novos)} ep(s) novo(s)")
-            adicionados = 0
-            for ep in eps_novos:
-                if not _tempo_ok():
-                    parou_por_tempo = True
-                    break
-                resolved = _resolve_episode(ep["Id"], api_key, user_id)
-                if resolved:
-                    num = str(count_local + adicionados + 1)
-                    anime_salvo.setdefault("episodes", []).append({
-                        "id": ep["Id"],
-                        "num": num,
-                        "url": resolved["url"],
-                        "sub": resolved["sub"],
-                    })
-                    adicionados += 1
+        # contagem divergiu → busca eps novos
+        print(f"[{idx}/{total}] ATUALIZAR: {anime_salvo.get('name')} "
+              f"(local={count_local}, server={count_server})")
+        _anime_change_sleep()
+        try:
+            eps_jellyfin = get_episodes(sid, user_id, api_key)
+        except requests.RequestException as e:
+            print(f"  [WARN] Falha ao listar eps: {e}")
+            continue
 
-            if not anime_salvo.get("logo_url"):
-                anime_salvo["logo_url"] = logo_url(s)
-            if not anime_salvo.get("poster"):
-                anime_salvo["poster"] = poster_url(s)
+        eps_salvas = {_clean_id(e["id"]) for e in anime_salvo.get("episodes", [])}
+        eps_novos = [ep for ep in eps_jellyfin if ep["Id"] not in eps_salvas]
 
-            if adicionados:
-                atualizados += 1
+        if not eps_novos:
+            sem_mudanca += 1
+            continue
 
-            if not parou_por_tempo:
-                checkpoint.add(sid)
+        adicionados = 0
+        for ep in eps_novos:
+            resolved = _resolve_episode(ep["Id"], api_key, user_id)
+            if resolved:
+                anime_salvo.setdefault("episodes", []).append({
+                    "id": ep["Id"],
+                    "num": str(count_local + adicionados + 1),
+                    "url": resolved["url"],
+                    "sub": resolved["sub"],
+                })
+                adicionados += 1
 
-            lib["_sync_checkpoint"] = {"done": list(checkpoint)}
+        # atualiza logo/poster se estava vazio
+        if not anime_salvo.get("logo_url"):
+            anime_salvo["logo_url"] = logo_url(s)
+        if not anime_salvo.get("poster"):
+            anime_salvo["poster"] = poster_url(s)
+
+        if adicionados:
+            atualizados += 1
+            print(f"  → {adicionados} ep(s) adicionado(s)")
             save_library(lib)
 
-            if parou_por_tempo:
-                break
-
-        else:
-            # loop terminou sem break = varreu tudo neste ciclo → limpa checkpoint
-            if "_sync_checkpoint" in lib:
-                del lib["_sync_checkpoint"]
-            print("[CHECKPOINT] Ciclo completo. Checkpoint apagado.")
-
-    finally:
-        lib["_sync_checkpoint"] = {"done": list(checkpoint)}
-        save_library(lib)
-        # Se ciclo terminou limpo, já foi apagado antes do finally — garante limpeza
-        if not parou_por_tempo and "_sync_checkpoint" in lib:
-            del lib["_sync_checkpoint"]
-            save_library(lib)
-
-    status = "PAUSADO (continua no próximo run)" if parou_por_tempo else "CONCLUÍDO"
-    print(f"[DONE/{status}] Novos: {novos} | Atualizados: {atualizados} | Sem mudança: {sem_mudanca} "
-          f"| Checkpoint: {len(checkpoint)} animes marcados.")
+    print(f"[DONE] Novos: {novos} | Atualizados: {atualizados} | Sem mudança: {sem_mudanca}")
 
 
 def mode_all(api_key: str, user_id: str, limit: int = 0):
